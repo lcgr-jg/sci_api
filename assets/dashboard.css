@@ -1,0 +1,51 @@
+/* Native Bootstrap selects (dbc.Select) on dark dashboard. */
+
+select.dashboard-dropdown,
+.dashboard-dropdown select,
+.dashboard-dropdown.form-control,
+.dashboard-dropdown.custom-select {
+  background-color: #21262d !important;
+  color: #e6edf3 !important;
+  border-color: #30363d !important;
+}
+
+select.dashboard-dropdown option,
+.dashboard-dropdown option {
+  background-color: #21262d;
+  color: #e6edf3;
+}
+
+/* Fallback if any dcc.Dropdown (react-select v5) remains */
+.dashboard-dropdown [class*="-control"] {
+  background-color: #21262d !important;
+  border-color: #30363d !important;
+  color: #e6edf3 !important;
+  min-height: 38px;
+}
+
+.dashboard-dropdown [class*="-singleValue"],
+.dashboard-dropdown [class*="-placeholder"],
+.dashboard-dropdown [class*="-input"] {
+  color: #e6edf3 !important;
+}
+
+.dashboard-dropdown [class*="-menu"] {
+  background-color: #21262d !important;
+  border-color: #30363d !important;
+}
+
+.dashboard-dropdown [class*="-option"] {
+  background-color: #21262d !important;
+  color: #e6edf3 !important;
+}
+
+.dashboard-dropdown [class*="-option"]:hover,
+.dashboard-dropdown [class*="-option"]:active {
+  background-color: #30363d !important;
+  color: #f0f6fc !important;
+}
+
+/* Bootstrap muted text on dark background */
+.text-muted {
+  color: #8b949e !important;
+}
