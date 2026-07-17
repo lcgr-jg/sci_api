@@ -17,6 +17,7 @@ from src.transforms import (
     merge_monthly_inventories,
     merge_monthly_petchem,
     merge_profit_models,
+    merge_crude_output,
     merge_provincial_processing,
     merge_provincial_product_output,
     merge_refined_export_shipping,
@@ -26,6 +27,7 @@ from src.transforms import (
     package_to_frames,
     parse_balance_monthly,
     parse_consumption,
+    parse_crude_output,
     parse_export_quotas_monthly,
     parse_export_quotas_summary,
     parse_kerosene_refueling,
@@ -86,6 +88,7 @@ def fetch_merged_history(
     refueling_parts = []
     provincial_processing_parts = []
     provincial_output_parts = []
+    crude_output_parts = []
     monthly_petchem_parts = []
     monthly_inventory_parts = []
     export_shipping_parts = []
@@ -132,6 +135,7 @@ def fetch_merged_history(
                 calendar_year=pub_year,
             )
         )
+        crude_output_parts.append(parse_crude_output(_find("crude", "output")))
         export_shipping_parts.append(
             parse_refined_export_shipping(
                 _find("refined oil shipping", exclude=("forecast",))
@@ -154,6 +158,7 @@ def fetch_merged_history(
     petchem_inventories = merge_monthly_inventories(monthly_inventory_parts)
     provincial_processing = merge_provincial_processing(provincial_processing_parts)
     provincial_output = merge_provincial_product_output(provincial_output_parts)
+    crude_output = merge_crude_output(crude_output_parts)
     export_shipping = merge_refined_export_shipping(export_shipping_parts)
     export_quotas_monthly = merge_export_quotas_monthly(export_quotas_monthly_parts)
 
@@ -196,6 +201,7 @@ def fetch_merged_history(
     base_frames["kerosene_refueling_national"] = kerosene_refueling_national
     base_frames["provincial_processing"] = provincial_processing
     base_frames["provincial_output"] = provincial_output
+    base_frames["crude_output"] = crude_output
     base_frames["export_shipping"] = export_shipping
     base_frames["export_forecast"] = export_forecast
     base_frames["export_quotas_monthly"] = export_quotas_monthly

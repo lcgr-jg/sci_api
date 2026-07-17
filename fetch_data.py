@@ -42,6 +42,7 @@ FRAME_NAMES = [
     "margins_wide",
     "provincial_processing",
     "provincial_output",
+    "crude_output",
     "petchem_weekly",
     "petchem_monthly",
     "petchem_inventories",

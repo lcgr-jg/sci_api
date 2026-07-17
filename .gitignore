@@ -26,5 +26,8 @@ Thumbs.db
 # Regenerable fetch cache (keep static data/ assets tracked)
 data/cache/
 
+# Generated desk reports
+data/reports/
+
 # Ad-hoc local test artifacts
 _test.parquet

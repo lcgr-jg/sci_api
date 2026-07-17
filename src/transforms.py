@@ -243,6 +243,162 @@ def merge_provincial_product_output(parts: list[pd.DataFrame]) -> pd.DataFrame:
     )
 
 
+# Equity-owner columns on SCI "15.Crude output". "Others" oilfield is not attributed
+# to these four in the source totals, so it is kept as its own ownership bucket.
+CRUDE_EQUITY_OWNERS = ("PetroChina", "Sinopec", "CNOOC", "Yanchang")
+
+# Stable oilfield → operator map (validated against 2026 SCI monthly totals).
+OILFIELD_OWNERSHIP: dict[str, str] = {
+    "Dagang Oilfield": "PetroChina",
+    "Huabei Oilfield": "PetroChina",
+    "Jidong Oilfield": "PetroChina",
+    "Liaohe Oilfield": "PetroChina",
+    "Jilin Oilfield": "PetroChina",
+    "Daqing Oilfield": "PetroChina",
+    "Changqing Oilfield": "PetroChina",
+    "Yumen Oilfield": "PetroChina",
+    "Qinghai Oilfield": "PetroChina",
+    "Tuha Oilfield": "PetroChina",
+    "Xinjiang Oilfield": "PetroChina",
+    "Tarim Oilfield": "PetroChina",
+    "Xinan Oilfield": "PetroChina",
+    "Baise Oilfield": "PetroChina",
+    "Shanghai Oilfield": "Sinopec",
+    "Jiangsu Oilfield": "Sinopec",
+    "Shengli Oilfield": "Sinopec",
+    "Zhongyuan Oilfield": "Sinopec",
+    "Henan Oilfield": "Sinopec",
+    "Jianghan Oilfield": "Sinopec",
+    "Tahe Oilfield": "Sinopec",
+    "Offshore crude": "CNOOC",
+    "Yanchang Oilfield": "Yanchang",
+    "Others": "Others",
+}
+
+
+def parse_crude_output(sheet: dict) -> pd.DataFrame:
+    """
+    Monthly crude production by province, equity owner, and oilfield (kt).
+
+    Returns long rows with metric_type in {province_total, equity_owner, field}.
+    National rollup row Province=='Total' is dropped (rebuild from provinces if needed).
+    """
+    cols = [
+        "month_start",
+        "province",
+        "metric_type",
+        "name",
+        "ownership",
+        "production_kt",
+    ]
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df["month_start"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    df = df.dropna(subset=["month_start"])
+    df = df[df["Province"].astype(str) != "Total"]
+
+    field_cols = [
+        c
+        for c in df.columns
+        if c not in ("Date", "Province", "Total", *CRUDE_EQUITY_OWNERS, "month_start")
+    ]
+
+    rows: list[dict] = []
+    for _, raw in df.iterrows():
+        province = str(raw["Province"])
+        month_start = raw["month_start"]
+        total = pd.to_numeric(raw.get("Total"), errors="coerce")
+        if pd.notna(total):
+            rows.append(
+                {
+                    "month_start": month_start,
+                    "province": province,
+                    "metric_type": "province_total",
+                    "name": province,
+                    "ownership": None,
+                    "production_kt": float(total),
+                }
+            )
+
+        for owner in CRUDE_EQUITY_OWNERS:
+            val = pd.to_numeric(raw.get(owner), errors="coerce")
+            if pd.isna(val) or val == 0:
+                continue
+            rows.append(
+                {
+                    "month_start": month_start,
+                    "province": province,
+                    "metric_type": "equity_owner",
+                    "name": owner,
+                    "ownership": owner,
+                    "production_kt": float(val),
+                }
+            )
+
+        for field in field_cols:
+            val = pd.to_numeric(raw.get(field), errors="coerce")
+            if pd.isna(val) or val == 0:
+                continue
+            owner = OILFIELD_OWNERSHIP.get(field, "Others")
+            rows.append(
+                {
+                    "month_start": month_start,
+                    "province": province,
+                    "metric_type": "field",
+                    "name": field,
+                    "ownership": owner,
+                    "production_kt": float(val),
+                }
+            )
+
+        # Residual "Others" oilfield is not in the four equity-owner columns.
+        others_val = pd.to_numeric(raw.get("Others"), errors="coerce")
+        if pd.notna(others_val) and others_val != 0:
+            # equity_owner row for Others (field row already emitted above)
+            rows.append(
+                {
+                    "month_start": month_start,
+                    "province": province,
+                    "metric_type": "equity_owner",
+                    "name": "Others",
+                    "ownership": "Others",
+                    "production_kt": float(others_val),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame(rows)
+    # Drop duplicate equity_owner Others if field loop + residual both added it once each
+    # (field loop does not add equity_owner; residual does — no dup). Keep stable order.
+    return (
+        out[cols]
+        .drop_duplicates(
+            subset=["month_start", "province", "metric_type", "name", "ownership"],
+            keep="last",
+        )
+        .sort_values(["month_start", "province", "metric_type", "ownership", "name"])
+        .reset_index(drop=True)
+    )
+
+
+def merge_crude_output(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    if not parts:
+        return parse_crude_output({"DataList": []})
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values(["month_start", "province", "metric_type", "ownership", "name"])
+        .drop_duplicates(
+            subset=["month_start", "province", "metric_type", "name", "ownership"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+
 def build_runs_wide(weekly: pd.DataFrame) -> pd.DataFrame:
     """Pivot weekly runs metrics to one row per week_start × breakdown."""
     runs = weekly[weekly["metric"].isin(["processing_kt", "operating_rate"])]
@@ -1074,6 +1230,7 @@ def package_to_frames(package: dict) -> dict[str, pd.DataFrame]:
         _find("operating", "ownership"),
         pub_year=pub_year,
     )
+    crude_output = parse_crude_output(_find("crude", "output"))
     ws = _find("weekly", "summary")
     ms = _find("monthly", "summary")
     petchem_weekly = parse_weekly_chemical(ws)
@@ -1101,6 +1258,7 @@ def package_to_frames(package: dict) -> dict[str, pd.DataFrame]:
         "shandong_stocks_total": shandong_stocks_totals(stocks),
         "processing_ownership": processing,
         "operating_rate_ownership": operating_rate,
+        "crude_output": crude_output,
         "petchem_weekly": petchem_weekly,
         "petchem_monthly": petchem_monthly,
         "petchem_inventories": petchem_inventories,

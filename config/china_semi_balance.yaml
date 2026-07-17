@@ -1,0 +1,19 @@
+# China semi-balance desk table (SCI processing + local crude + FSU pipeline).
+# Edit months / fsu.path for the next request; then rerun the script or notebook.
+
+months:
+  start: "2026-01-01"
+  end: "2026-06-01"
+
+barrels_per_mt: 7.33
+
+fsu:
+  # Glob is resolved under sci_api/; swap the file when a new interim drops.
+  path: "FSU-*_bpd_interim.xlsx"
+  sheet: "Crude Oil"
+  routes:
+    - "China via Kazakhstan"
+    - "China via ESPO"
+
+output:
+  path: "data/reports/china_semi_balance.xlsx"
