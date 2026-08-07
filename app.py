@@ -8,15 +8,17 @@ Tabs
 ----
 0  Crude Runs     – weekly/monthly processing & operating rates
 1  Processing & Operating rate – provincial CDU volume/rate by owner vs refinery map
-2  Products       – gasoline/diesel output + national commercial stocks
+2  Products       – gasoline/diesel output + national commercial stocks + weekly change table
 3  Shandong       – independent refinery city stocks
 4  Economics      – refinery margins vs runs
 5  Seasonal         – year-over-year crude runs & product output by month
-6  Consumption      – national demand seasonality by product (grid)
-7  Petchem          – chemical output seasonality, weekly trends & inventories
+6  Consumption      – national demand seasonality, MoM/YoY, mobility vs gasoline/diesel
+7  Petchem          – chemical output seasonality, weekly trends, inventories + MoM/YoY table
 8  Monthly Detail – provincial processing by ownership
 9  Regional       – geographic runs, output & consumption comparison
-10 Exports        – refined product shipping, quotas & monthly export table
+10 Exports        – refined product shipping, quotas, forward plan tracker & monthly export table
+11 Crude Imports  – foreign/domestic crude shipping, fleet/grades & independent import quotas
+12 Oil Grade      – Shandong independent feedstock slate by grade / origin
 """
 
 from __future__ import annotations
@@ -76,8 +78,11 @@ from src.petchem import (
     fig_petchem_timeseries,
 )
 from src.exports import (
+    export_forecast_summary_records,
+    export_forecast_table_records,
     export_monthly_table_records,
     fig_export_destinations,
+    fig_export_forecast_plan,
     fig_export_monthly_stacked,
     fig_export_provinces,
     fig_export_quota_summary,
@@ -86,6 +91,46 @@ from src.exports import (
 )
 from src.transforms import EXPORT_TABLE_PRODUCTS
 from src.units import convert_volume_series, volume_label
+from src.change_tables import (
+    change_table_columns,
+    consumption_change_records,
+    fig_products_delta_bars,
+    petchem_change_records,
+    products_scorecard_records,
+    products_scorecard_style,
+)
+from src.crude_shipping import (
+    fig_crude_discharge_lag_trend,
+    fig_crude_fleet_mix,
+    fig_crude_fleet_mix_trend,
+    fig_crude_grade_mix_trend,
+    fig_crude_grades,
+    fig_crude_monthly_arrivals,
+    fig_crude_origin_mix_trend,
+    fig_crude_origins,
+    fig_crude_province_mix_trend,
+    fig_crude_provinces,
+    fig_crude_quota_summary,
+    fig_crude_quotas_monthly,
+    fig_crude_transit_trend,
+    origin_transit_compare_columns,
+    origin_transit_compare_records,
+    origin_transit_delta_style,
+)
+from src.oil_grade import (
+    fig_oil_grade_city_bars,
+    fig_oil_grade_origin_mix,
+    fig_oil_grade_top_grades,
+    fig_oil_grade_totals,
+)
+from src.mobility import (
+    fig_diesel_vs_trucks,
+    fig_gasoline_vs_nev,
+    fig_passenger_possession,
+    fig_passenger_sales_mix,
+    fig_truck_possession_mix,
+    fig_truck_sales_mix,
+)
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -124,8 +169,20 @@ MARGIN_COLORS = {
 }
 
 
-def _apply_dark(fig: go.Figure, *, height: int | None = None) -> go.Figure:
-    fig.update_layout(template=DARK_TPL, margin=dict(l=50, r=60, t=50, b=40))
+def _apply_dark(
+    fig: go.Figure,
+    *,
+    height: int | None = None,
+    margin: dict | None = None,
+) -> go.Figure:
+    m = dict(l=50, r=60, t=50, b=40)
+    if margin:
+        m.update(margin)
+    # Keep taller top margin when charts reserve space for an external-title + top legend.
+    existing_t = fig.layout.margin.t if fig.layout.margin else None
+    if existing_t is not None and existing_t > m["t"]:
+        m["t"] = existing_t
+    fig.update_layout(template=DARK_TPL, margin=m)
     if height:
         fig.update_layout(height=height)
     return fig
@@ -147,6 +204,35 @@ def _dropdown(**kwargs) -> dbc.Select:
     props.pop("optionHeight", None)
     props.pop("maxHeight", None)
     return dbc.Select(**props)
+
+
+# Shared dark DataTable chrome (matches Exports monthly table).
+_TABLE_STYLE_HEADER = {
+    "backgroundColor": "#21262d",
+    "color": "#e6edf3",
+    "fontWeight": "600",
+    "border": "1px solid #30363d",
+}
+_TABLE_STYLE_CELL = {
+    "backgroundColor": "#161b22",
+    "color": "#e6edf3",
+    "border": "1px solid #30363d",
+    "textAlign": "right",
+    "padding": "6px 10px",
+    "fontSize": "0.85rem",
+}
+
+
+def _dark_datatable(**kwargs) -> dash_table.DataTable:
+    props = {
+        "style_table": {"overflowX": "auto"},
+        "style_header": _TABLE_STYLE_HEADER,
+        "style_cell": _TABLE_STYLE_CELL,
+        "style_as_list_view": True,
+        "page_size": 20,
+    }
+    props.update(kwargs)
+    return dash_table.DataTable(**props)
 
 
 def _vol(
@@ -184,6 +270,15 @@ def _load_data(refresh: bool, history: bool) -> dict[str, pd.DataFrame]:
         fetch_and_cache(include_history=history)
         frames = load_cached_frames()
     if frames is None or "export_shipping" not in frames:
+        fetch_and_cache(include_history=history)
+        frames = load_cached_frames()
+    if frames is None or "crude_shipping" not in frames:
+        fetch_and_cache(include_history=history)
+        frames = load_cached_frames()
+    if frames is None or "processing_oil_grade" not in frames:
+        fetch_and_cache(include_history=history)
+        frames = load_cached_frames()
+    if frames is None or "vehicle_sales_passenger" not in frames:
         fetch_and_cache(include_history=history)
         frames = load_cached_frames()
     if frames is None:
@@ -422,7 +517,7 @@ def fig_shandong_heatmap(stocks: pd.DataFrame, product: str, date_range: str) ->
         title=f"Shandong {product.replace('_', ' ')} stocks by city (kt, monthly avg)",
         xaxis=dict(tickangle=-45, type="category"),
     )
-    return _apply_dark(fig, height=480)
+    return _apply_dark(fig, height=420)
 
 
 def fig_monthly_processing(proc: pd.DataFrame, ownership: str, unit: str, date_range: str) -> go.Figure:
@@ -666,6 +761,15 @@ def _po_province_options() -> list[dict[str, str]]:
     return [{"label": p, "value": p} for p in provinces]
 
 
+def _oil_grade_city_options() -> list[dict[str, str]]:
+    df = FRAMES.get("processing_oil_grade", pd.DataFrame())
+    opts = [{"label": "All cities", "value": "All"}]
+    if df is None or df.empty or "city" not in df.columns:
+        return opts
+    cities = sorted(df["city"].dropna().unique())
+    return opts + [{"label": c, "value": c} for c in cities]
+
+
 def _build_layout() -> dbc.Container:
     return dbc.Container(
         [
@@ -757,7 +861,73 @@ def _build_layout() -> dbc.Container:
                     ),
                     dbc.Tab(
                         label="Products & Stocks",
-                        children=[dcc.Graph(id="products-chart", config={"displayModeBar": True})],
+                        children=[
+                            dcc.Graph(id="products-chart", config={"displayModeBar": True}),
+                            html.H5("Weekly scorecard", className="mt-3 mb-1"),
+                            html.P(
+                                "Latest week at a glance. Apparent demand ≈ output − inventory build "
+                                "(ex-exports). Days cover = stocks ÷ daily production "
+                                "(stocks × 7 / weekly output) — not vs demand. "
+                                "Kerosene has no national commercial stocks in SCI.",
+                                className="text-muted small mb-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        _dropdown(
+                                            id="products-stock-unit",
+                                            options=[
+                                                {"label": "Stocks: mb", "value": "mb"},
+                                                {"label": "Stocks: kt", "value": "kt"},
+                                            ],
+                                            value="mb",
+                                        ),
+                                        width=2,
+                                    ),
+                                    dbc.Col(
+                                        _dropdown(
+                                            id="products-flow-unit",
+                                            options=[
+                                                {"label": "Flows: kb/d", "value": "kbd"},
+                                                {"label": "Flows: kt", "value": "kt"},
+                                            ],
+                                            value="kbd",
+                                        ),
+                                        width=2,
+                                    ),
+                                ],
+                                className="g-2 mb-2",
+                            ),
+                            _dark_datatable(
+                                id="products-change-table",
+                                columns=[{"name": "product", "id": "product"}],
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": "product"}, "textAlign": "left"}
+                                ],
+                                style_data_conditional=products_scorecard_style(),
+                                page_size=10,
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="products-inv-delta-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="products-output-delta-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2 mt-2",
+                            ),
+                        ],
                     ),
                     dbc.Tab(
                         label="Shandong Stocks",
@@ -906,6 +1076,134 @@ def _build_layout() -> dbc.Container:
                                 className="text-muted small mt-2 mb-1",
                             ),
                             dcc.Graph(id="consumption-seasonal-grid", config={"displayModeBar": True}),
+                            html.H5("Monthly demand change (MoM / YoY)", className="mt-3 mb-1"),
+                            html.P(
+                                "SCI national consumption products plus jet refueling. "
+                                "Levels follow the global unit toggle (kt / kb/d).",
+                                className="text-muted small mb-2",
+                            ),
+                            _dark_datatable(
+                                id="consumption-change-table",
+                                columns=change_table_columns("kbd"),
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": c}, "textAlign": "left"}
+                                    for c in ("product", "month")
+                                ],
+                            ),
+                            html.H5("Mobility vs fuel demand", className="mt-4 mb-1"),
+                            html.P(
+                                "SCI vehicle sales & possession only (no external source). "
+                                "Passenger powertrains overlay gasoline demand; "
+                                "heavy/medium/light/pickup trucks overlay diesel. "
+                                "Sales shares move first; possession mix shows the slower "
+                                "fleet shift that actually drives fuel demand.",
+                                className="text-muted small mb-1",
+                            ),
+                            html.P(
+                                [
+                                    html.Strong("Powertrain terms: "),
+                                    "BEV = battery electric (no engine); ",
+                                    "PHEV = plug-in hybrid (grid-chargeable + engine); ",
+                                    "EREV = extended-range EV (drives electric, engine mainly as generator); ",
+                                    "HEV = non-plug-in hybrid (engine + battery, cannot charge from grid). ",
+                                    "NEV in SCI broadly covers BEV + PHEV + EREV.",
+                                ],
+                                className="text-muted small mb-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Gasoline demand vs passenger NEV / ICE sales share",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-gasoline-nev",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Passenger sales mix by powertrain",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-passenger-mix",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Diesel demand vs truck diesel / NEV sales share",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-diesel-trucks",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Truck sales mix (H/M/L/pickup)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-truck-sales-mix",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2 mt-1",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Truck fleet mix by fuel (possession)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-truck-possession",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Passenger fleet mix by powertrain (possession, annual)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-passenger-possession",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2 mt-1",
+                            ),
                         ],
                     ),
                     dbc.Tab(
@@ -952,6 +1250,20 @@ def _build_layout() -> dbc.Container:
                             ),
                             dcc.Graph(id="petchem-timeseries-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="petchem-inventories-chart", config={"displayModeBar": True}),
+                            html.H5("Monthly petchem output change (MoM / YoY)", className="mt-3 mb-1"),
+                            html.P(
+                                "SCI monthly chemical output. Levels follow the global unit toggle.",
+                                className="text-muted small mb-2",
+                            ),
+                            _dark_datatable(
+                                id="petchem-change-table",
+                                columns=change_table_columns("kbd"),
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": c}, "textAlign": "left"}
+                                    for c in ("product", "month")
+                                ],
+                            ),
                         ],
                     ),
                     dbc.Tab(
@@ -1113,6 +1425,85 @@ def _build_layout() -> dbc.Container:
                             dcc.Graph(id="export-sankey-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="export-quotas-monthly-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="export-quota-summary-chart", config={"displayModeBar": True}),
+                            html.H5("Forward export plan tracker", className="mt-3 mb-1"),
+                            html.P(
+                                "Sheet 41 weekly cargo forecasts stand in for SCI company monthly "
+                                "export plans (not published in the API datapack). Compare planned "
+                                "loadings vs MTD actuals and the same month last year.",
+                                className="text-muted small mb-2",
+                            ),
+                            dcc.Graph(id="export-forecast-plan-chart", config={"displayModeBar": True}),
+                            _dark_datatable(
+                                id="export-forecast-summary-table",
+                                columns=[
+                                    {"name": "month", "id": "month"},
+                                    {"name": "product", "id": "product"},
+                                    {
+                                        "name": "planned_kt",
+                                        "id": "planned_kt",
+                                        "type": "numeric",
+                                        "format": {"specifier": ",.1f"},
+                                    },
+                                    {
+                                        "name": "mtd_actual_kt",
+                                        "id": "mtd_actual_kt",
+                                        "type": "numeric",
+                                        "format": {"specifier": ",.1f"},
+                                    },
+                                    {
+                                        "name": "remaining_vs_plan_kt",
+                                        "id": "remaining_vs_plan_kt",
+                                        "type": "numeric",
+                                        "format": {"specifier": ",.1f"},
+                                    },
+                                    {
+                                        "name": "same_month_ly_kt",
+                                        "id": "same_month_ly_kt",
+                                        "type": "numeric",
+                                        "format": {"specifier": ",.1f"},
+                                    },
+                                ],
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": c}, "textAlign": "left"}
+                                    for c in ("month", "product")
+                                ],
+                                page_size=10,
+                            ),
+                            html.H6("Plan-month cargo detail", className="mt-3 mb-2"),
+                            _dark_datatable(
+                                id="export-forecast-cargo-table",
+                                columns=[
+                                    {"name": "departure", "id": "departure"},
+                                    {"name": "product", "id": "product"},
+                                    {
+                                        "name": "volume_kt",
+                                        "id": "volume_kt",
+                                        "type": "numeric",
+                                        "format": {"specifier": ",.1f"},
+                                    },
+                                    {"name": "province", "id": "province"},
+                                    {"name": "port", "id": "port"},
+                                    {"name": "destination", "id": "destination"},
+                                    {"name": "ship", "id": "ship"},
+                                ],
+                                data=[],
+                                style_cell_conditional=[
+                                    {
+                                        "if": {"column_id": c},
+                                        "textAlign": "left",
+                                    }
+                                    for c in (
+                                        "departure",
+                                        "product",
+                                        "province",
+                                        "port",
+                                        "destination",
+                                        "ship",
+                                    )
+                                ],
+                                page_size=12,
+                            ),
                             html.H5("Monthly exports (kt)", className="mt-3 mb-2"),
                             dbc.Row(
                                 [
@@ -1144,25 +1535,297 @@ def _build_layout() -> dbc.Container:
                                 ],
                                 data=[],
                                 style_table={"overflowX": "auto"},
-                                style_header={
-                                    "backgroundColor": "#21262d",
-                                    "color": "#e6edf3",
-                                    "fontWeight": "600",
-                                    "border": "1px solid #30363d",
-                                },
-                                style_cell={
-                                    "backgroundColor": "#161b22",
-                                    "color": "#e6edf3",
-                                    "border": "1px solid #30363d",
-                                    "textAlign": "right",
-                                    "padding": "6px 10px",
-                                },
+                                style_header=_TABLE_STYLE_HEADER,
+                                style_cell=_TABLE_STYLE_CELL,
                                 style_cell_conditional=[
                                     {"if": {"column_id": "month"}, "textAlign": "left"}
                                 ],
                                 page_size=15,
                             ),
                             dcc.Download(id="export-monthly-download"),
+                        ],
+                    ),
+                    dbc.Tab(
+                        label="Crude Imports",
+                        children=[
+                            html.P(
+                                "Port crude arrivals: foreign trade (sheet 36/37) and domestic "
+                                "coastal (38/39), plus independent-refinery crude import quotas "
+                                "(sheet 44). Forecast cargoes overlay the plan month.",
+                                className="text-muted small mt-2 mb-1",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        _dropdown(
+                                            id="crude-trade",
+                                            options=[
+                                                {"label": "All trades", "value": "all"},
+                                                {"label": "Foreign", "value": "foreign"},
+                                                {"label": "Domestic", "value": "domestic"},
+                                            ],
+                                            value="foreign",
+                                        ),
+                                        width=2,
+                                    ),
+                                    dbc.Col(
+                                        _dropdown(
+                                            id="crude-period",
+                                            options=[
+                                                {"label": "Latest month", "value": "latest"},
+                                                {
+                                                    "label": "Full selected period",
+                                                    "value": "full",
+                                                },
+                                            ],
+                                            value="latest",
+                                        ),
+                                        width=2,
+                                    ),
+                                ],
+                                className="mt-2 g-2",
+                            ),
+                            dcc.Graph(
+                                id="crude-monthly-chart",
+                                config={"displayModeBar": True},
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="crude-origins-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="crude-provinces-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="crude-fleet-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="crude-grades-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            html.H5("Mix over time", className="mt-3 mb-1"),
+                            html.P(
+                                "Monthly share of arrivals (100% stacked). Dashed line = "
+                                "top-3 category concentration. Top 8 categories + Other; "
+                                "follows trade + date-range filters.",
+                                className="text-muted small mb-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Fleet mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-fleet-mix-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Origin-country mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-origin-mix-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Discharge-province mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-province-mix-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Crude-grade mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-grade-mix-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            html.H5("Voyage logistics", className="mt-3 mb-1"),
+                            html.P(
+                                "Transit = arrival - origin departure. Discharge lag = "
+                                "discharge - arrival (port wait proxy). Extreme transit "
+                                "outliers are dropped. Red delta vs LY = slower; green = faster.",
+                                className="text-muted small mb-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Voyage transit days (median + p25-p75)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-transit-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Discharge lag (median + p25-p75)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="crude-discharge-lag-trend",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            html.H6(
+                                "Origin transit — latest month vs same month LY",
+                                className="mt-3 mb-2 text-center",
+                            ),
+                            _dark_datatable(
+                                id="crude-origin-transit-table",
+                                columns=origin_transit_compare_columns(),
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": c}, "textAlign": "left"}
+                                    for c in ("month", "origin")
+                                ],
+                                style_data_conditional=origin_transit_delta_style(),
+                                page_size=12,
+                            ),
+                            html.H5(
+                                "Independent crude import quotas",
+                                className="mt-3 mb-1",
+                            ),
+                            html.P(
+                                "Quota sheet covers independent refineries only "
+                                "(not SOE imports). Ceiling can exceed issued annual quota.",
+                                className="text-muted small mb-2",
+                            ),
+                            dcc.Graph(
+                                id="crude-quotas-monthly-chart",
+                                config={"displayModeBar": True},
+                            ),
+                            dcc.Graph(
+                                id="crude-quota-summary-chart",
+                                config={"displayModeBar": True},
+                            ),
+                        ],
+                    ),
+                    dbc.Tab(
+                        label="Oil Grade",
+                        children=[
+                            html.P(
+                                "Shandong independent refinery crude processing by oil grade "
+                                "(sheet 16). Origin buckets group grades by country / domestic / "
+                                "secondary residue feedstock.",
+                                className="text-muted small mt-2 mb-1",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        _dropdown(
+                                            id="oil-grade-city",
+                                            options=_oil_grade_city_options(),
+                                            value="All",
+                                        ),
+                                        width=3,
+                                    ),
+                                ],
+                                className="mt-2 g-2",
+                            ),
+                            dcc.Graph(
+                                id="oil-grade-totals-chart",
+                                config={"displayModeBar": True},
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="oil-grade-city-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        dcc.Graph(
+                                            id="oil-grade-top-chart",
+                                            config={"displayModeBar": True},
+                                        ),
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            html.H6(
+                                "Origin-bucket mix over time",
+                                className="mt-3 mb-1 text-center text-light",
+                            ),
+                            html.P(
+                                "Monthly share of grade volumes (ex totals). Dashed line = "
+                                "top-3 origin concentration.",
+                                className="text-muted small mb-2 text-center",
+                            ),
+                            dcc.Graph(
+                                id="oil-grade-mix-chart",
+                                config={"displayModeBar": True},
+                            ),
                         ],
                     ),
                     dbc.Tab(
@@ -1216,11 +1879,39 @@ def update_runs_charts(unit, date_range):
 
 @app.callback(
     Output("products-chart", "figure"),
+    Output("products-change-table", "columns"),
+    Output("products-change-table", "data"),
+    Output("products-inv-delta-chart", "figure"),
+    Output("products-output-delta-chart", "figure"),
     Input("unit-select", "value"),
     Input("date-range-select", "value"),
+    Input("products-stock-unit", "value"),
+    Input("products-flow-unit", "value"),
 )
-def update_products(unit, date_range):
-    return fig_products(FRAMES["products_stocks_wide"], unit, date_range)
+def update_products(unit, date_range, stock_unit, flow_unit):
+    wide = FRAMES.get("products_stocks_wide", pd.DataFrame())
+    stock_unit = stock_unit or "mb"
+    flow_unit = flow_unit or "kbd"
+    records, columns = products_scorecard_records(
+        wide,
+        stock_unit=stock_unit,
+        flow_unit=flow_unit,
+    )
+    return (
+        fig_products(wide, unit, date_range),
+        columns,
+        records,
+        _apply_dark(
+            fig_products_delta_bars(
+                wide, kind="stocks", unit=stock_unit, date_range=date_range
+            )
+        ),
+        _apply_dark(
+            fig_products_delta_bars(
+                wide, kind="output", unit=flow_unit, date_range=date_range
+            )
+        ),
+    )
 
 
 @app.callback(
@@ -1303,6 +1994,8 @@ def update_seasonal(unit, runs_breakdown, product_col):
 
 @app.callback(
     Output("consumption-seasonal-grid", "figure"),
+    Output("consumption-change-table", "columns"),
+    Output("consumption-change-table", "data"),
     Input("unit-select", "value"),
 )
 def update_consumption_seasonal(unit):
@@ -1310,9 +2003,41 @@ def update_consumption_seasonal(unit):
     jet = FRAMES.get("kerosene_refueling_national", pd.DataFrame())
     n_panels = len(CONSUMPTION_PRODUCT_ORDER) + len(JET_FUEL_PRODUCT_ORDER)
     nrows = (n_panels + 1) // 2
-    return _apply_dark(
-        fig_consumption_seasonal_grid(cons, unit, jet),
-        height=320 * nrows,
+    table_unit = unit if unit in ("kt", "kbd") else "kbd"
+    return (
+        _apply_dark(
+            fig_consumption_seasonal_grid(cons, unit, jet),
+            height=320 * nrows,
+        ),
+        change_table_columns(table_unit),
+        consumption_change_records(cons, jet, unit=table_unit),
+    )
+
+
+@app.callback(
+    Output("mobility-gasoline-nev", "figure"),
+    Output("mobility-passenger-mix", "figure"),
+    Output("mobility-diesel-trucks", "figure"),
+    Output("mobility-truck-sales-mix", "figure"),
+    Output("mobility-truck-possession", "figure"),
+    Output("mobility-passenger-possession", "figure"),
+    Input("unit-select", "value"),
+)
+def update_mobility_charts(unit):
+    cons = FRAMES.get("consumption_national", pd.DataFrame())
+    pax_sales = FRAMES.get("vehicle_sales_passenger", pd.DataFrame())
+    com_sales = FRAMES.get("vehicle_sales_commercial", pd.DataFrame())
+    com_poss = FRAMES.get("vehicle_possession_commercial", pd.DataFrame())
+    pax_poss = FRAMES.get("vehicle_possession_passenger", pd.DataFrame())
+    return (
+        _apply_dark(fig_gasoline_vs_nev(cons, pax_sales, unit=unit), height=360),
+        _apply_dark(fig_passenger_sales_mix(pax_sales), height=360),
+        _apply_dark(
+            fig_diesel_vs_trucks(cons, com_sales, com_poss, unit=unit), height=360
+        ),
+        _apply_dark(fig_truck_sales_mix(com_sales), height=360),
+        _apply_dark(fig_truck_possession_mix(com_poss), height=360),
+        _apply_dark(fig_passenger_possession(pax_poss), height=360),
     )
 
 
@@ -1334,6 +2059,8 @@ def update_petchem_seasonal(unit):
 @app.callback(
     Output("petchem-timeseries-chart", "figure"),
     Output("petchem-inventories-chart", "figure"),
+    Output("petchem-change-table", "columns"),
+    Output("petchem-change-table", "data"),
     Input("unit-select", "value"),
     Input("date-range-select", "value"),
     Input("petchem-product", "value"),
@@ -1343,6 +2070,7 @@ def update_petchem(unit, date_range, product, inventory_view):
     weekly = FRAMES.get("petchem_weekly", pd.DataFrame())
     monthly = FRAMES.get("petchem_monthly", pd.DataFrame())
     inventories = FRAMES.get("petchem_inventories", pd.DataFrame())
+    table_unit = unit if unit in ("kt", "kbd") else "kbd"
     return (
         _apply_dark(
             fig_petchem_timeseries(weekly, monthly, product or "PX", unit, date_range)
@@ -1355,6 +2083,8 @@ def update_petchem(unit, date_range, product, inventory_view):
             ),
             height=620 if (inventory_view or "all") == "all" else None,
         ),
+        change_table_columns(table_unit),
+        petchem_change_records(monthly, unit=table_unit),
     )
 
 
@@ -1518,6 +2248,9 @@ def update_monthly(ownership, unit, date_range):
     Output("export-sankey-chart", "figure"),
     Output("export-quotas-monthly-chart", "figure"),
     Output("export-quota-summary-chart", "figure"),
+    Output("export-forecast-plan-chart", "figure"),
+    Output("export-forecast-summary-table", "data"),
+    Output("export-forecast-cargo-table", "data"),
     Output("export-monthly-table", "data"),
     Input("date-range-select", "value"),
     Input("export-product", "value"),
@@ -1570,6 +2303,9 @@ def update_exports(date_range, product, period, monthly_source):
         ),
         _apply_dark(fig_export_quotas_monthly(quotas_monthly)),
         _apply_dark(fig_export_quota_summary(quotas_summary, quotas_monthly)),
+        _apply_dark(fig_export_forecast_plan(forecast, shipping, product=product)),
+        export_forecast_summary_records(forecast, shipping, product=product),
+        export_forecast_table_records(forecast, product=product),
         export_monthly_table_records(
             shipping,
             quotas_monthly,
@@ -1593,6 +2329,139 @@ def download_export_monthly(n_clicks, monthly_source):
         source=monthly_source or "shipping",
     )
     return dcc.send_data_frame(df.to_csv, "china_exports_monthly.csv", index=False)
+
+
+@app.callback(
+    Output("crude-monthly-chart", "figure"),
+    Output("crude-origins-chart", "figure"),
+    Output("crude-provinces-chart", "figure"),
+    Output("crude-fleet-chart", "figure"),
+    Output("crude-grades-chart", "figure"),
+    Output("crude-fleet-mix-trend", "figure"),
+    Output("crude-origin-mix-trend", "figure"),
+    Output("crude-province-mix-trend", "figure"),
+    Output("crude-grade-mix-trend", "figure"),
+    Output("crude-transit-trend", "figure"),
+    Output("crude-discharge-lag-trend", "figure"),
+    Output("crude-origin-transit-table", "data"),
+    Output("crude-quotas-monthly-chart", "figure"),
+    Output("crude-quota-summary-chart", "figure"),
+    Input("unit-select", "value"),
+    Input("date-range-select", "value"),
+    Input("crude-trade", "value"),
+    Input("crude-period", "value"),
+)
+def update_crude_imports(unit, date_range, trade, period):
+    shipping = FRAMES.get("crude_shipping", pd.DataFrame())
+    forecast = FRAMES.get("crude_forecast", pd.DataFrame())
+    quotas_monthly = FRAMES.get("crude_quotas_monthly", pd.DataFrame())
+    quotas_summary = FRAMES.get("crude_quotas_summary", pd.DataFrame())
+    trade = trade or "foreign"
+    period = period or "latest"
+    unit = unit if unit in ("kt", "kbd") else "kt"
+
+    return (
+        _apply_dark(
+            fig_crude_monthly_arrivals(
+                shipping,
+                forecast,
+                trade=trade,
+                date_range=date_range,
+                unit=unit,
+            )
+        ),
+        _apply_dark(
+            fig_crude_origins(
+                shipping, trade=trade, date_range=date_range, period=period
+            )
+        ),
+        _apply_dark(
+            fig_crude_provinces(
+                shipping, trade=trade, date_range=date_range, period=period
+            )
+        ),
+        _apply_dark(
+            fig_crude_fleet_mix(
+                shipping, trade=trade, date_range=date_range, period=period
+            )
+        ),
+        _apply_dark(
+            fig_crude_grades(
+                shipping, trade=trade, date_range=date_range, period=period
+            )
+        ),
+        _apply_dark(
+            fig_crude_fleet_mix_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        _apply_dark(
+            fig_crude_origin_mix_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        _apply_dark(
+            fig_crude_province_mix_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        _apply_dark(
+            fig_crude_grade_mix_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        _apply_dark(
+            fig_crude_transit_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        _apply_dark(
+            fig_crude_discharge_lag_trend(
+                shipping, trade=trade, date_range=date_range
+            ),
+            height=480,
+        ),
+        origin_transit_compare_records(shipping, trade=trade),
+        _apply_dark(fig_crude_quotas_monthly(quotas_monthly)),
+        _apply_dark(fig_crude_quota_summary(quotas_summary, quotas_monthly)),
+    )
+
+
+@app.callback(
+    Output("oil-grade-totals-chart", "figure"),
+    Output("oil-grade-city-chart", "figure"),
+    Output("oil-grade-top-chart", "figure"),
+    Output("oil-grade-mix-chart", "figure"),
+    Input("unit-select", "value"),
+    Input("date-range-select", "value"),
+    Input("oil-grade-city", "value"),
+)
+def update_oil_grade(unit, date_range, city):
+    df = FRAMES.get("processing_oil_grade", pd.DataFrame())
+    city = city or "All"
+    unit = unit if unit in ("kt", "kbd") else "kt"
+    return (
+        _apply_dark(
+            fig_oil_grade_totals(df, city=city, date_range=date_range, unit=unit)
+        ),
+        _apply_dark(
+            fig_oil_grade_city_bars(df, date_range=date_range, unit=unit)
+        ),
+        _apply_dark(
+            fig_oil_grade_top_grades(
+                df, city=city, date_range=date_range, unit=unit
+            )
+        ),
+        _apply_dark(
+            fig_oil_grade_origin_mix(df, city=city, date_range=date_range),
+            height=480,
+        ),
+    )
 
 
 @app.callback(

@@ -115,8 +115,42 @@ def monthly_kt_to_kbd(
     return monthly_kt / days * factor
 
 
+# 1 oil barrel ≈ 158.987 liters = 0.158987 kiloliters
+LITERS_PER_BARREL = 158.987294
+KL_PER_BARREL = LITERS_PER_BARREL / 1000.0
+
+# Display units used by the dashboard (flows vs stocks differ in meaning for kbd).
+VOLUME_UNIT_LABELS: dict[str, str] = {
+    "kt": "kt",
+    "kbd": "kb/d",
+    "kl": "kl",
+    "mb": "mb",
+    "bbl": "kb",  # thousand barrels (week/month total), template-style "bbl"
+}
+
+
 def volume_label(unit: str) -> str:
-    return "kb/d" if unit == "kbd" else "kt"
+    return VOLUME_UNIT_LABELS.get(unit, unit)
+
+
+def kt_to_barrels(values_kt: pd.Series, product: str | None = None) -> pd.Series:
+    """Convert kilotonnes to barrels (absolute volume, not a rate)."""
+    return values_kt * 1000.0 * barrels_per_mt(product)
+
+
+def kt_to_kl(values_kt: pd.Series, product: str | None = None) -> pd.Series:
+    """Convert kilotonnes to kiloliters via product barrels/mt."""
+    return kt_to_barrels(values_kt, product) * KL_PER_BARREL
+
+
+def kt_to_mb(values_kt: pd.Series, product: str | None = None) -> pd.Series:
+    """Convert kilotonnes to million barrels."""
+    return kt_to_barrels(values_kt, product) / 1_000_000.0
+
+
+def kt_to_kb(values_kt: pd.Series, product: str | None = None) -> pd.Series:
+    """Convert kilotonnes to thousand barrels (week/month total)."""
+    return values_kt * barrels_per_mt(product)
 
 
 def convert_volume_series(
@@ -129,11 +163,20 @@ def convert_volume_series(
     metric: str | None = None,
 ) -> pd.Series:
     """Convert kt series to display unit. Operating rates pass through unchanged."""
-    if unit != "kbd":
-        return values
     prod = product or product_for_metric(metric)
-    if freq == "weekly":
-        return weekly_kt_to_kbd(values, prod)
-    if freq == "monthly" and dates is not None:
-        return monthly_kt_to_kbd(values, pd.to_datetime(dates), prod)
+    if unit in (None, "kt"):
+        return values
+    if unit == "kbd":
+        if freq == "weekly":
+            return weekly_kt_to_kbd(values, prod)
+        if freq == "monthly" and dates is not None:
+            return monthly_kt_to_kbd(values, pd.to_datetime(dates), prod)
+        return values
+    if unit == "kl":
+        return kt_to_kl(values, prod)
+    if unit == "mb":
+        return kt_to_mb(values, prod)
+    if unit == "bbl":
+        # Template "bbl" column ≈ thousand barrels for the period (kb).
+        return kt_to_kb(values, prod)
     return values

@@ -12,33 +12,48 @@ from src.transforms import (
     build_kerosene_refueling_national,
     merge_balance_monthly,
     merge_consumption,
+    merge_crude_output,
+    merge_crude_port_shipping,
     merge_export_quotas_monthly,
     merge_kerosene_refueling,
     merge_monthly_inventories,
     merge_monthly_petchem,
+    merge_processing_by_oil_grade,
     merge_profit_models,
-    merge_crude_output,
     merge_provincial_processing,
     merge_provincial_product_output,
     merge_refined_export_shipping,
     merge_shandong_stocks,
+    merge_vehicle_possession_commercial,
+    merge_vehicle_possession_passenger,
+    merge_vehicle_sales_commercial,
+    merge_vehicle_sales_passenger,
+    merge_vehicle_sales_simple,
     merge_weekly_chemical,
     merge_weekly_summaries,
     package_to_frames,
     parse_balance_monthly,
     parse_consumption,
+    parse_crude_import_quotas,
     parse_crude_output,
+    parse_crude_port_shipping,
     parse_export_quotas_monthly,
     parse_export_quotas_summary,
     parse_kerosene_refueling,
     parse_monthly_inventories,
     parse_monthly_petchem,
+    parse_processing_by_oil_grade,
     parse_profit_model,
     parse_provincial_processing,
     parse_provincial_product_output,
     parse_refined_export_forecast,
     parse_refined_export_shipping,
     parse_shandong_stocks,
+    parse_vehicle_possession_commercial,
+    parse_vehicle_possession_passenger,
+    parse_vehicle_sales_commercial,
+    parse_vehicle_sales_passenger,
+    parse_vehicle_sales_simple,
     parse_weekly_chemical,
     parse_weekly_summary,
 )
@@ -93,6 +108,14 @@ def fetch_merged_history(
     monthly_inventory_parts = []
     export_shipping_parts = []
     export_quotas_monthly_parts = []
+    crude_foreign_parts = []
+    crude_domestic_parts = []
+    oil_grade_parts = []
+    vehicle_sales_simple_parts = []
+    vehicle_sales_passenger_parts = []
+    vehicle_sales_commercial_parts = []
+    vehicle_possession_passenger_parts = []
+    vehicle_possession_commercial_parts = []
 
     for pubdate, pkg in packages:
         sheets = {s["SheetName"]: s for s in pkg.get("SheetList", [])}
@@ -144,6 +167,69 @@ def fetch_merged_history(
         export_quotas_monthly_parts.append(
             parse_export_quotas_monthly(_find("product quotas"))
         )
+        try:
+            crude_foreign_parts.append(
+                parse_crude_port_shipping(
+                    _find("foreign", "shipping", exclude=("forecast",)),
+                    trade="foreign",
+                    is_forecast=False,
+                )
+            )
+        except KeyError:
+            pass
+        try:
+            crude_domestic_parts.append(
+                parse_crude_port_shipping(
+                    _find("domestic", "shipping", exclude=("forecast",)),
+                    trade="domestic",
+                    is_forecast=False,
+                )
+            )
+        except KeyError:
+            pass
+        try:
+            oil_grade_parts.append(
+                parse_processing_by_oil_grade(_find("processing", "oil", "grade"))
+            )
+        except KeyError:
+            pass
+        try:
+            vehicle_sales_simple_parts.append(
+                parse_vehicle_sales_simple(
+                    _find("vehicle sales", exclude=("commercial", "passenger")),
+                    calendar_year=pub_year,
+                )
+            )
+        except KeyError:
+            pass
+        try:
+            vehicle_sales_passenger_parts.append(
+                parse_vehicle_sales_passenger(_find("vehicle sales", "passenger"))
+            )
+        except KeyError:
+            pass
+        try:
+            vehicle_sales_commercial_parts.append(
+                parse_vehicle_sales_commercial(_find("vehicle sales", "commercial"))
+            )
+        except KeyError:
+            pass
+        try:
+            vehicle_possession_passenger_parts.append(
+                parse_vehicle_possession_passenger(
+                    _find("vehicle possession", "passenger")
+                )
+            )
+        except KeyError:
+            pass
+        try:
+            vehicle_possession_commercial_parts.append(
+                parse_vehicle_possession_commercial(
+                    _find("vehicle possession", "commercial")
+                )
+            )
+        except KeyError:
+            pass
 
     weekly = merge_weekly_summaries(weekly_parts)
     petchem_weekly = merge_weekly_chemical(weekly_chemical_parts)
@@ -161,6 +247,19 @@ def fetch_merged_history(
     crude_output = merge_crude_output(crude_output_parts)
     export_shipping = merge_refined_export_shipping(export_shipping_parts)
     export_quotas_monthly = merge_export_quotas_monthly(export_quotas_monthly_parts)
+    crude_shipping = merge_crude_port_shipping(crude_foreign_parts + crude_domestic_parts)
+    processing_oil_grade = merge_processing_by_oil_grade(oil_grade_parts)
+    vehicle_sales_simple = merge_vehicle_sales_simple(vehicle_sales_simple_parts)
+    vehicle_sales_passenger = merge_vehicle_sales_passenger(vehicle_sales_passenger_parts)
+    vehicle_sales_commercial = merge_vehicle_sales_commercial(
+        vehicle_sales_commercial_parts
+    )
+    vehicle_possession_passenger = merge_vehicle_possession_passenger(
+        vehicle_possession_passenger_parts
+    )
+    vehicle_possession_commercial = merge_vehicle_possession_commercial(
+        vehicle_possession_commercial_parts
+    )
 
     latest_sheets = {s["SheetName"]: s for s in latest_package.get("SheetList", [])}
 
@@ -178,6 +277,39 @@ def fetch_merged_history(
         _find_latest("refined oil shipping", "forecast")
     )
     export_quotas_summary = parse_export_quotas_summary(_find_latest("product quotas"))
+
+    crude_forecast_parts = []
+    try:
+        crude_forecast_parts.append(
+            parse_crude_port_shipping(
+                _find_latest("foreign", "shipping", "forecast"),
+                trade="foreign",
+                is_forecast=True,
+            )
+        )
+    except KeyError:
+        pass
+    try:
+        crude_forecast_parts.append(
+            parse_crude_port_shipping(
+                _find_latest("domestic", "shipping", "forecast"),
+                trade="domestic",
+                is_forecast=True,
+            )
+        )
+    except KeyError:
+        pass
+    crude_forecast = merge_crude_port_shipping(crude_forecast_parts)
+
+    try:
+        # Year comes from sheet topic (e.g. "2026 Independent…").
+        crude_quotas_summary, crude_quotas_monthly = parse_crude_import_quotas(
+            _find_latest("crude", "quotas")
+        )
+    except KeyError:
+        crude_quotas_summary, crude_quotas_monthly = parse_crude_import_quotas(
+            {"DataList": []}
+        )
 
     from src.transforms import (
         build_margins_wide,
@@ -206,6 +338,16 @@ def fetch_merged_history(
     base_frames["export_forecast"] = export_forecast
     base_frames["export_quotas_monthly"] = export_quotas_monthly
     base_frames["export_quotas_summary"] = export_quotas_summary
+    base_frames["crude_shipping"] = crude_shipping
+    base_frames["crude_forecast"] = crude_forecast
+    base_frames["crude_quotas_summary"] = crude_quotas_summary
+    base_frames["crude_quotas_monthly"] = crude_quotas_monthly
+    base_frames["processing_oil_grade"] = processing_oil_grade
+    base_frames["vehicle_sales_simple"] = vehicle_sales_simple
+    base_frames["vehicle_sales_passenger"] = vehicle_sales_passenger
+    base_frames["vehicle_sales_commercial"] = vehicle_sales_commercial
+    base_frames["vehicle_possession_passenger"] = vehicle_possession_passenger
+    base_frames["vehicle_possession_commercial"] = vehicle_possession_commercial
     base_frames["margins"] = margins
     base_frames["margins_wide"] = build_margins_wide(margins)
 

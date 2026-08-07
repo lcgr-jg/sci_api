@@ -50,6 +50,16 @@ FRAME_NAMES = [
     "export_forecast",
     "export_quotas_monthly",
     "export_quotas_summary",
+    "crude_shipping",
+    "crude_forecast",
+    "crude_quotas_summary",
+    "crude_quotas_monthly",
+    "processing_oil_grade",
+    "vehicle_sales_simple",
+    "vehicle_sales_passenger",
+    "vehicle_sales_commercial",
+    "vehicle_possession_passenger",
+    "vehicle_possession_commercial",
 ]
 
 

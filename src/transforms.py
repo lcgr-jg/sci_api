@@ -1206,6 +1206,575 @@ def build_export_monthly_from_quotas(quotas_monthly: pd.DataFrame) -> pd.DataFra
     )
 
 
+# ---------------------------------------------------------------------------
+# Crude port shipping (sheets 36–39) and independent crude import quotas (44).
+# ---------------------------------------------------------------------------
+
+_CRUDE_MONTH_COLS = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+]
+
+CRUDE_SHIPPING_COLS = [
+    "trade",
+    "ship_name",
+    "ship_grade",
+    "origin_country",
+    "departure_date",
+    "province",
+    "discharge_port",
+    "arrival_date",
+    "discharge_date",
+    "volume_kt",
+    "crude_grade",
+    "month_start",
+]
+
+
+def parse_crude_port_shipping(
+    sheet: dict,
+    *,
+    trade: str,
+    is_forecast: bool = False,
+) -> pd.DataFrame:
+    """
+    Cargo-level crude arrivals at Chinese ports.
+
+    trade: ``foreign`` | ``domestic``
+    Arrival date is actual (sheet 36/38) or estimated (sheet 37/39).
+    """
+    empty = pd.DataFrame(columns=CRUDE_SHIPPING_COLS)
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return empty
+
+    arrival_src = "Estimated arrival date" if is_forecast else "Actual arrival date"
+    # API headers include awkward double-spaces / trailing spaces — match flexibly.
+    colmap: dict[str, str] = {}
+    for c in df.columns:
+        cl = str(c).strip().lower().replace("  ", " ")
+        if cl == "ship name":
+            colmap[c] = "ship_name"
+        elif cl == "ship grade":
+            colmap[c] = "ship_grade"
+        elif cl == "origin country":
+            colmap[c] = "origin_country"
+        elif cl.startswith("departure date"):
+            colmap[c] = "departure_date"
+        elif "province" in cl and "discharge" in cl:
+            colmap[c] = "province"
+        elif cl == "port of discharge":
+            colmap[c] = "discharge_port"
+        elif cl == arrival_src.strip().lower():
+            colmap[c] = "arrival_date"
+        elif cl == "discharge date":
+            colmap[c] = "discharge_date"
+        elif cl.startswith("volume"):
+            colmap[c] = "volume_kt"
+        elif cl == "crude grade":
+            colmap[c] = "crude_grade"
+
+    out = df.rename(columns=colmap)
+    for col in ("departure_date", "arrival_date", "discharge_date"):
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.normalize()
+        else:
+            out[col] = pd.NaT
+
+    if "volume_kt" not in out.columns:
+        return empty
+    out["volume_kt"] = pd.to_numeric(out["volume_kt"], errors="coerce")
+    out = out.dropna(subset=["arrival_date", "volume_kt"])
+    out["trade"] = trade
+    if "origin_country" not in out.columns:
+        out["origin_country"] = None
+    for col in ("ship_name", "ship_grade", "province", "discharge_port", "crude_grade"):
+        if col not in out.columns:
+            out[col] = None
+    out["month_start"] = out["arrival_date"].values.astype("datetime64[M]")
+    return (
+        out[CRUDE_SHIPPING_COLS]
+        .sort_values(["arrival_date", "province", "discharge_port"])
+        .reset_index(drop=True)
+    )
+
+
+def merge_crude_port_shipping(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    if not parts:
+        return pd.DataFrame(columns=CRUDE_SHIPPING_COLS)
+    merged = pd.concat(parts, ignore_index=True)
+    key = [
+        "trade",
+        "ship_name",
+        "arrival_date",
+        "discharge_port",
+        "volume_kt",
+        "crude_grade",
+        "origin_country",
+    ]
+    return (
+        merged.sort_values("arrival_date")
+        .drop_duplicates(subset=key, keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def parse_crude_import_quotas(
+    sheet: dict,
+    *,
+    quota_year: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Independent-refinery crude import quotas (sheet 44).
+
+    Returns (summary_one_row, monthly_long).
+    """
+    summary_cols = [
+        "quota_year",
+        "ceiling_kt",
+        "batch_1_kt",
+        "batch_2_kt",
+        "batch_3_kt",
+        "batch_4_kt",
+        "batch_5_kt",
+        "annual_quota_kt",
+        "total_imports_kt",
+        "utilization",
+        "remarks",
+    ]
+    monthly_cols = ["quota_year", "month", "month_start", "import_kt"]
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=summary_cols), pd.DataFrame(columns=monthly_cols)
+
+    row = df.iloc[0]
+    topic = str(sheet.get("Topic") or "")
+    year = quota_year
+    if year is None:
+        m = re.search(r"(20\d{2})", topic)
+        year = int(m.group(1)) if m else pd.Timestamp.today().year
+
+    def _num(col: str) -> float | None:
+        if col not in row.index:
+            return None
+        val = pd.to_numeric(row[col], errors="coerce")
+        return float(val) if pd.notna(val) else None
+
+    summary = pd.DataFrame(
+        [
+            {
+                "quota_year": year,
+                "ceiling_kt": _num("Ceiling quotas for independent refineries"),
+                "batch_1_kt": _num("1st batch of crude import quota"),
+                "batch_2_kt": _num("2nd batch of crude import quota"),
+                "batch_3_kt": _num("3rd batch of crude import quota"),
+                "batch_4_kt": _num("4th batch of crude import quota"),
+                "batch_5_kt": _num("5th batch of crude import quota"),
+                "annual_quota_kt": _num("Annual total quota"),
+                "total_imports_kt": _num("Total imports"),
+                "utilization": _num("Utilization"),
+                "remarks": row.get("Remarks"),
+            }
+        ]
+    )
+
+    monthly_rows = []
+    for i, label in enumerate(_CRUDE_MONTH_COLS, start=1):
+        val = _num(label)
+        if val is None:
+            continue
+        monthly_rows.append(
+            {
+                "quota_year": year,
+                "month": i,
+                "month_start": pd.Timestamp(year=year, month=i, day=1),
+                "import_kt": val,
+            }
+        )
+    monthly = pd.DataFrame(monthly_rows, columns=monthly_cols)
+    return summary, monthly
+
+
+# ---------------------------------------------------------------------------
+# Shandong independent processing by oil grade (sheet 16).
+# ---------------------------------------------------------------------------
+
+_OIL_GRADE_META_COLS = {
+    "Month",
+    "City",
+    "Total primary feedstock processing volume",
+    "Secondary feedstock processing volume",
+}
+
+_OIL_GRADE_DOMESTIC = {
+    "Shengli crude oil",
+    "Marine oil",
+    "Other domestic crude oil",
+}
+
+_OIL_GRADE_SECONDARY = {
+    "M100",
+    "Straight-run 180CST",
+    "380CST",
+    "Straight-run 280CST",
+    "Cutback asphalt",
+    "Chinese-made residue",
+    "Chinese-made VGO",
+}
+
+_COUNTRY_ALIASES = {
+    "u.s.": "United States",
+    "us": "United States",
+    "u.s": "United States",
+    "columbia": "Colombia",
+    "saudi arabia": "Saudi Arabia",
+    "uae": "UAE",
+    "uk": "United Kingdom",
+    "equatorial guinea": "Equatorial Guinea",
+    "south africa": "South Africa",
+}
+
+
+def _oil_grade_bucket(grade: str) -> str:
+    g = grade.strip()
+    if g in _OIL_GRADE_DOMESTIC:
+        return "Domestic"
+    if g in _OIL_GRADE_SECONDARY or g.startswith("Straight-run") or g.endswith("CST"):
+        return "Secondary / residue"
+    if g == "Other imported crude":
+        return "Other imported"
+    # "Country-Grade" or "Country -Grade"
+    parts = re.split(r"\s*-\s*", g, maxsplit=1)
+    if len(parts) >= 1 and parts[0]:
+        key = parts[0].strip().lower()
+        return _COUNTRY_ALIASES.get(key, parts[0].strip())
+    return "Other"
+
+
+def parse_processing_by_oil_grade(sheet: dict) -> pd.DataFrame:
+    """
+    Shandong independent refinery feedstock by city and oil grade (sheet 16).
+
+    Long rows: month_start, city, grade, origin_bucket, volume_kt.
+    Also emits synthetic rows grade='_total_primary' / '_total_secondary' for totals.
+    """
+    cols = ["month_start", "city", "grade", "origin_bucket", "volume_kt"]
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Normalize awkward column names (trailing spaces / encoding).
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    if "Month" not in df.columns or "City" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    df["month_start"] = pd.to_datetime(df["Month"], errors="coerce").dt.normalize()
+    df["city"] = df["City"].astype(str).str.strip()
+    df = df.dropna(subset=["month_start", "city"])
+
+    grade_cols = [c for c in df.columns if c not in ("Month", "City", "month_start", "city")]
+    rows: list[dict] = []
+    for _, raw in df.iterrows():
+        month_start = raw["month_start"]
+        city = raw["city"]
+        for col in grade_cols:
+            val = pd.to_numeric(raw.get(col), errors="coerce")
+            if pd.isna(val) or val == 0:
+                continue
+            if col == "Total primary feedstock processing volume":
+                grade, bucket = "_total_primary", "Total"
+            elif col == "Secondary feedstock processing volume":
+                grade, bucket = "_total_secondary", "Total"
+            else:
+                grade, bucket = col, _oil_grade_bucket(col)
+            rows.append(
+                {
+                    "month_start": month_start,
+                    "city": city,
+                    "grade": grade,
+                    "origin_bucket": bucket,
+                    "volume_kt": float(val),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return (
+        pd.DataFrame(rows)[cols]
+        .sort_values(["month_start", "city", "origin_bucket", "grade"])
+        .reset_index(drop=True)
+    )
+
+
+def merge_processing_by_oil_grade(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["month_start", "city", "grade", "origin_bucket", "volume_kt"]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("month_start")
+        .drop_duplicates(subset=["month_start", "city", "grade"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vehicle sales / possession (sheets 26–30) — mobility vs gasoline/diesel demand
+# ---------------------------------------------------------------------------
+
+# Truck segments that matter for diesel (micro trucks are mostly gasoline).
+DIESEL_TRUCK_TYPES = ("Heavy truck", "Medium truck", "Light truck", "Pickup truck")
+
+_PASSENGER_POWERTRAIN_COLS = {
+    "Gasoline": "gasoline",
+    "Diesel": "diesel",
+    "BEV": "bev",
+    "Plug-in hybrid": "phev",
+    "Non plug-in hybrid": "hev",
+    "Extended-range electric": "erev",
+    "Non-plug-in extended-range electric": "non_plugin_erev",
+    "CNG": "cng",
+    "Others": "others",
+    "Total": "total",
+}
+
+_COMMERCIAL_FUEL_COLS = {
+    "Diesel": "diesel",
+    "Gasoline": "gasoline",
+    "CNG": "cng",
+    "LNG": "lng",
+    "New energy": "new_energy",
+    "Others": "others",
+    "Total": "total",
+}
+
+
+def _sheet_calendar_year(sheet: dict, fallback: int | None = None) -> int | None:
+    """Prefer year embedded in Topic (e.g. '2026 China Vehicle Sales')."""
+    topic = str(sheet.get("Topic") or "")
+    m = re.search(r"(20\d{2})", topic)
+    if m:
+        return int(m.group(1))
+    return fallback
+
+
+def parse_vehicle_sales_simple(sheet: dict, calendar_year: int | None = None) -> pd.DataFrame:
+    """
+    Sheet 26 — province × month sales by broad vehicle type (ICE gasoline/diesel/NEV/LNG).
+
+    Long rows: month_start, province, vehicle_type, units.
+    """
+    cols = ["month_start", "province", "vehicle_type", "units"]
+    year = _sheet_calendar_year(sheet, calendar_year)
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty or year is None:
+        return pd.DataFrame(columns=cols)
+
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    if "Province" not in df.columns or "Vehicle type" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    month_cols = [c for c in CONSUMPTION_MONTHS if c in df.columns]
+    long = df.melt(
+        id_vars=["Province", "Vehicle type"],
+        value_vars=month_cols,
+        var_name="month_label",
+        value_name="units",
+    )
+    long["units"] = pd.to_numeric(long["units"], errors="coerce")
+    long = long.dropna(subset=["units"])
+    long["month"] = long["month_label"].map({m: i + 1 for i, m in enumerate(CONSUMPTION_MONTHS)})
+    long["month_start"] = pd.to_datetime(
+        dict(year=year, month=long["month"], day=1)
+    )
+    long["province"] = long["Province"].astype(str).str.strip()
+    long["vehicle_type"] = long["Vehicle type"].astype(str).str.strip()
+    return (
+        long[cols]
+        .sort_values(["month_start", "province", "vehicle_type"])
+        .reset_index(drop=True)
+    )
+
+
+def parse_vehicle_sales_passenger(sheet: dict) -> pd.DataFrame:
+    """Sheet 28 — passenger sales by powertrain (province × month)."""
+    value_cols = list(_PASSENGER_POWERTRAIN_COLS.values())
+    cols = ["month_start", "province"] + value_cols
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    # "Breakdown" holds province names in this sheet.
+    geo_col = "Breakdown" if "Breakdown" in df.columns else "Province"
+    if "Date" not in df.columns or geo_col not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame()
+    out["month_start"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    out["province"] = df[geo_col].astype(str).str.strip()
+    for src, dst in _PASSENGER_POWERTRAIN_COLS.items():
+        out[dst] = pd.to_numeric(df[src], errors="coerce") if src in df.columns else pd.NA
+    out = out.dropna(subset=["month_start", "province"])
+    return out[cols].sort_values(["month_start", "province"]).reset_index(drop=True)
+
+
+def parse_vehicle_sales_commercial(sheet: dict) -> pd.DataFrame:
+    """Sheet 27 — commercial sales by vehicle type × fuel (province × month)."""
+    value_cols = list(_COMMERCIAL_FUEL_COLS.values())
+    cols = ["month_start", "province", "vehicle_type"] + value_cols
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    if "Date" not in df.columns or "Province" not in df.columns or "Vehicle type" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame()
+    out["month_start"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    out["province"] = df["Province"].astype(str).str.strip()
+    out["vehicle_type"] = df["Vehicle type"].astype(str).str.strip()
+    for src, dst in _COMMERCIAL_FUEL_COLS.items():
+        out[dst] = pd.to_numeric(df[src], errors="coerce") if src in df.columns else pd.NA
+    out = out.dropna(subset=["month_start", "province", "vehicle_type"])
+    return (
+        out[cols]
+        .sort_values(["month_start", "province", "vehicle_type"])
+        .reset_index(drop=True)
+    )
+
+
+def parse_vehicle_possession_passenger(sheet: dict) -> pd.DataFrame:
+    """
+    Sheet 30 — passenger fleet possession by powertrain.
+
+    Annual snapshot (Date often a year float like 2025.0).
+    """
+    value_cols = list(_PASSENGER_POWERTRAIN_COLS.values())
+    cols = ["year", "province"] + value_cols
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    geo_col = "Breakdown" if "Breakdown" in df.columns else "Province"
+    if "Date" not in df.columns or geo_col not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    raw_date = pd.to_numeric(df["Date"], errors="coerce")
+    # Year float (2025.0) or a timestamp year.
+    years = raw_date.round().astype("Int64")
+    # If values look like unix/ordinal nonsense, try datetime year.
+    if years.dropna().empty or (years.dropna() < 1990).any() or (years.dropna() > 2100).any():
+        years = pd.to_datetime(df["Date"], errors="coerce").dt.year.astype("Int64")
+
+    out = pd.DataFrame()
+    out["year"] = years
+    out["province"] = df[geo_col].astype(str).str.strip()
+    for src, dst in _PASSENGER_POWERTRAIN_COLS.items():
+        out[dst] = pd.to_numeric(df[src], errors="coerce") if src in df.columns else pd.NA
+    out = out.dropna(subset=["year", "province"])
+    out["year"] = out["year"].astype(int)
+    return out[cols].sort_values(["year", "province"]).reset_index(drop=True)
+
+
+def parse_vehicle_possession_commercial(sheet: dict) -> pd.DataFrame:
+    """Sheet 29 — commercial fleet possession by vehicle type × fuel (monthly)."""
+    value_cols = list(_COMMERCIAL_FUEL_COLS.values())
+    cols = ["month_start", "province", "vehicle_type"] + value_cols
+    df = pd.DataFrame(sheet.get("DataList", []))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    if "Date" not in df.columns or "Province" not in df.columns or "Vehicle type" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame()
+    out["month_start"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    out["province"] = df["Province"].astype(str).str.strip()
+    out["vehicle_type"] = df["Vehicle type"].astype(str).str.strip()
+    for src, dst in _COMMERCIAL_FUEL_COLS.items():
+        out[dst] = pd.to_numeric(df[src], errors="coerce") if src in df.columns else pd.NA
+    out = out.dropna(subset=["month_start", "province", "vehicle_type"])
+    return (
+        out[cols]
+        .sort_values(["month_start", "province", "vehicle_type"])
+        .reset_index(drop=True)
+    )
+
+
+def merge_vehicle_sales_simple(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["month_start", "province", "vehicle_type", "units"]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("month_start")
+        .drop_duplicates(subset=["month_start", "province", "vehicle_type"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def merge_vehicle_sales_passenger(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["month_start", "province"] + list(_PASSENGER_POWERTRAIN_COLS.values())
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("month_start")
+        .drop_duplicates(subset=["month_start", "province"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def merge_vehicle_sales_commercial(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["month_start", "province", "vehicle_type"] + list(_COMMERCIAL_FUEL_COLS.values())
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("month_start")
+        .drop_duplicates(subset=["month_start", "province", "vehicle_type"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def merge_vehicle_possession_passenger(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["year", "province"] + list(_PASSENGER_POWERTRAIN_COLS.values())
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("year")
+        .drop_duplicates(subset=["year", "province"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def merge_vehicle_possession_commercial(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    cols = ["month_start", "province", "vehicle_type"] + list(_COMMERCIAL_FUEL_COLS.values())
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values("month_start")
+        .drop_duplicates(subset=["month_start", "province", "vehicle_type"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
 def package_to_frames(package: dict) -> dict[str, pd.DataFrame]:
     """Extract dashboard-ready frames from a full API package payload."""
     pub_date = pd.to_datetime(package.get("PubDate"), errors="coerce")
