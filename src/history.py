@@ -42,6 +42,8 @@ from src.transforms import (
     parse_kerosene_refueling,
     parse_monthly_inventories,
     parse_monthly_petchem,
+    parse_operating_rate_ownership,
+    parse_processing_ownership,
     parse_processing_by_oil_grade,
     parse_profit_model,
     parse_provincial_processing,
@@ -67,6 +69,71 @@ HISTORY_PUBDATES = (
     "2024-12-31T00:00:00",
     "2025-12-31T00:00:00",
 )
+
+_CDU_UNIT = "FEEDSTOCK PRIMARY PROCESSING UNITS"
+
+
+def _merge_ownership_monthly(parts: list[pd.DataFrame], value_col: str) -> pd.DataFrame:
+    """
+    Merge monthly province x ownership sheets across historical snapshots.
+
+    Keep latest snapshot value for duplicate keys.
+    """
+    cols = ["month_start", "unit", "province", "ownership", value_col]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    merged = pd.concat(parts, ignore_index=True)
+    return (
+        merged.sort_values(["month_start", "unit", "province", "ownership"])
+        .drop_duplicates(
+            subset=["month_start", "unit", "province", "ownership"],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def _maybe_fix_processing_ownership_scale(
+    processing_ownership: pd.DataFrame,
+    provincial_processing: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Correct rare snapshot-level scaling mismatch in ownership processing.
+
+    Some snapshots can report ownership rows at exactly 1/10 of provincial totals.
+    When that pattern is detected consistently for the snapshot, rescale by 10.
+    """
+    if processing_ownership.empty or provincial_processing.empty:
+        return processing_ownership
+
+    own_scope = processing_ownership[processing_ownership["unit"] == _CDU_UNIT]
+    if own_scope.empty:
+        return processing_ownership
+
+    own_monthly = (
+        own_scope.groupby("month_start", as_index=False)["processing_kt"]
+        .sum()
+        .rename(columns={"processing_kt": "own_total"})
+    )
+    prov_monthly = (
+        provincial_processing.groupby("month_start", as_index=False)["processing_kt"]
+        .sum()
+        .rename(columns={"processing_kt": "prov_total"})
+    )
+
+    ratio_df = own_monthly.merge(prov_monthly, on="month_start", how="inner")
+    ratio_df = ratio_df[ratio_df["prov_total"] != 0]
+    if ratio_df.empty:
+        return processing_ownership
+
+    median_ratio = (ratio_df["own_total"] / ratio_df["prov_total"]).median()
+    if 0.095 <= median_ratio <= 0.105:
+        fixed = processing_ownership.copy()
+        mask = fixed["unit"] == _CDU_UNIT
+        fixed.loc[mask, "processing_kt"] = fixed.loc[mask, "processing_kt"] * 10.0
+        return fixed
+
+    return processing_ownership
 
 
 def fetch_merged_history(
@@ -104,6 +171,8 @@ def fetch_merged_history(
     provincial_processing_parts = []
     provincial_output_parts = []
     crude_output_parts = []
+    processing_ownership_parts = []
+    operating_rate_ownership_parts = []
     monthly_petchem_parts = []
     monthly_inventory_parts = []
     export_shipping_parts = []
@@ -146,10 +215,24 @@ def fetch_merged_history(
         monthly_inventory_parts.append(
             parse_monthly_inventories(_find("monthly", "summary"), calendar_year=pub_year)
         )
-        provincial_processing_parts.append(
-            parse_provincial_processing(
-                _find("processing", "volume", exclude=("ownership",)),
-                calendar_year=pub_year,
+        prov_processing = parse_provincial_processing(
+            _find("processing", "volume", exclude=("ownership",)),
+            calendar_year=pub_year,
+        )
+        own_processing = parse_processing_ownership(
+            _find("processing", "ownership"),
+            pub_year=pub_year,
+        )
+        # Guard against year-specific SCI scaling glitches before global merge.
+        own_processing = _maybe_fix_processing_ownership_scale(
+            own_processing, prov_processing
+        )
+        provincial_processing_parts.append(prov_processing)
+        processing_ownership_parts.append(own_processing)
+        operating_rate_ownership_parts.append(
+            parse_operating_rate_ownership(
+                _find("operating", "ownership"),
+                pub_year=pub_year,
             )
         )
         provincial_output_parts.append(
@@ -244,6 +327,12 @@ def fetch_merged_history(
     petchem_inventories = merge_monthly_inventories(monthly_inventory_parts)
     provincial_processing = merge_provincial_processing(provincial_processing_parts)
     provincial_output = merge_provincial_product_output(provincial_output_parts)
+    processing_ownership = _merge_ownership_monthly(
+        processing_ownership_parts, "processing_kt"
+    )
+    operating_rate_ownership = _merge_ownership_monthly(
+        operating_rate_ownership_parts, "operating_rate"
+    )
     crude_output = merge_crude_output(crude_output_parts)
     export_shipping = merge_refined_export_shipping(export_shipping_parts)
     export_quotas_monthly = merge_export_quotas_monthly(export_quotas_monthly_parts)
@@ -333,6 +422,8 @@ def fetch_merged_history(
     base_frames["kerosene_refueling_national"] = kerosene_refueling_national
     base_frames["provincial_processing"] = provincial_processing
     base_frames["provincial_output"] = provincial_output
+    base_frames["processing_ownership"] = processing_ownership
+    base_frames["operating_rate_ownership"] = operating_rate_ownership
     base_frames["crude_output"] = crude_output
     base_frames["export_shipping"] = export_shipping
     base_frames["export_forecast"] = export_forecast

@@ -115,6 +115,9 @@ def _parse_ownership_monthly(
         var_name="month_label",
         value_name=value_col,
     )
+    # Historical ownership snapshots sometimes use placeholders like "/".
+    # Coerce to numeric so only valid monthly values are kept.
+    long[value_col] = pd.to_numeric(long[value_col], errors="coerce")
     long = long.dropna(subset=[value_col])
 
     year = pub_year or pd.Timestamp.today().year
@@ -1074,6 +1077,21 @@ def merge_refined_export_shipping(parts: list[pd.DataFrame]) -> pd.DataFrame:
     )
 
 
+def _parse_sci_month(values: pd.Series) -> pd.Series:
+    """
+    Parse SCI sheet Month values.
+
+    Older datapacks use ISO dates (YYYY-MM-DD). From ~2026-09-04 the API
+    switched some sheets to Excel serial day numbers (e.g. 46023 → 2026-01-01).
+    """
+    iso = pd.to_datetime(values, format="%Y-%m-%d", errors="coerce")
+    serial = pd.to_numeric(values, errors="coerce")
+    from_serial = pd.to_datetime(
+        serial, unit="D", origin="1899-12-30", errors="coerce"
+    )
+    return iso.fillna(from_serial)
+
+
 def parse_export_quotas_monthly(sheet: dict) -> pd.DataFrame:
     """Monthly national export volumes by product from sheet 45."""
     df = pd.DataFrame(sheet.get("DataList", []))
@@ -1082,7 +1100,7 @@ def parse_export_quotas_monthly(sheet: dict) -> pd.DataFrame:
 
     rows = df[df["Product"].isin(EXPORT_QUOTA_PRODUCTS)].copy()
     rows = rows[rows["Month"].astype(str).str.lower() != "total"]
-    rows["Month"] = pd.to_datetime(rows["Month"], format="%Y-%m-%d", errors="coerce")
+    rows["Month"] = _parse_sci_month(rows["Month"])
     rows = rows[rows["Month"].notna()]
     rows["export_kt"] = pd.to_numeric(rows["Export"], errors="coerce")
     rows = rows.dropna(subset=["export_kt"])

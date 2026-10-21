@@ -10,13 +10,13 @@ Tabs
 1  Processing & Operating rate – provincial CDU volume/rate by owner vs refinery map
 2  Products       – gasoline/diesel output + national commercial stocks + weekly change table
 3  Shandong       – independent refinery city stocks
-4  Economics      – refinery margins vs runs
+4  Economics      – refinery margins vs runs + WoW profit drivers / waterfall
 5  Seasonal         – year-over-year crude runs & product output by month
 6  Consumption      – national demand seasonality, MoM/YoY, mobility vs gasoline/diesel
 7  Petchem          – chemical output seasonality, weekly trends, inventories + MoM/YoY table
 8  Monthly Detail – provincial processing by ownership
 9  Regional       – geographic runs, output & consumption comparison
-10 Exports        – refined product shipping, quotas, forward plan tracker & monthly export table
+10 Exports        – refined product shipping, quotas, forward forecast tracker & monthly export table
 11 Crude Imports  – foreign/domestic crude shipping, fleet/grades & independent import quotas
 12 Oil Grade      – Shandong independent feedstock slate by grade / origin
 """
@@ -80,9 +80,12 @@ from src.petchem import (
 from src.exports import (
     export_forecast_summary_records,
     export_forecast_table_records,
+    export_monthly_pivot_columns,
+    export_monthly_pivot_records,
     export_monthly_table_records,
     fig_export_destinations,
     fig_export_forecast_plan,
+    fig_export_forecast_sankey,
     fig_export_monthly_stacked,
     fig_export_provinces,
     fig_export_quota_summary,
@@ -90,7 +93,12 @@ from src.exports import (
     fig_export_sankey,
 )
 from src.transforms import EXPORT_TABLE_PRODUCTS
-from src.units import convert_volume_series, volume_label
+from src.units import (
+    DEFAULT_BARRELS_PER_MT,
+    SHANDONG_PRODUCT_MAP,
+    convert_volume_series,
+    volume_label,
+)
 from src.change_tables import (
     change_table_columns,
     consumption_change_records,
@@ -98,6 +106,13 @@ from src.change_tables import (
     petchem_change_records,
     products_scorecard_records,
     products_scorecard_style,
+    runs_scorecard_records,
+    runs_scorecard_style,
+)
+from src.economics import (
+    fig_profit_waterfall,
+    profit_driver_scorecard,
+    profit_driver_scorecard_style,
 )
 from src.crude_shipping import (
     fig_crude_discharge_lag_trend,
@@ -126,10 +141,16 @@ from src.oil_grade import (
 from src.mobility import (
     fig_diesel_vs_trucks,
     fig_gasoline_vs_nev,
+    fig_heavy_truck_possession_mix,
+    fig_heavy_truck_sales_mix,
     fig_passenger_possession,
     fig_passenger_sales_mix,
+    fig_passenger_sales_vs_possession,
+    fig_provincial_nev_bars,
+    fig_provincial_nev_map,
     fig_truck_possession_mix,
     fig_truck_sales_mix,
+    fig_truck_sales_vs_possession,
 )
 
 # ---------------------------------------------------------------------------
@@ -241,8 +262,19 @@ def _vol(
     freq: str = "weekly",
     dates: pd.Series | None = None,
     metric: str | None = None,
+    product: str | None = None,
 ) -> pd.Series:
-    return convert_volume_series(values, unit, freq=freq, dates=dates, metric=metric)
+    return convert_volume_series(
+        values, unit, freq=freq, dates=dates, metric=metric, product=product
+    )
+
+
+def _inventory_unit(flow_unit: str) -> str:
+    """Stocks are levels, not rates: kb/d mode → mb; metric mode → kt."""
+    return "mb" if (flow_unit or "kbd") == "kbd" else "kt"
+
+
+SHANDONG_STOCK_PRODUCTS = ("crude_oil", "gasoline", "diesel", "naphtha")
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +426,11 @@ def fig_soe_indep_spread(runs: pd.DataFrame, date_range: str) -> go.Figure:
 
 def fig_products(products: pd.DataFrame, unit: str, date_range: str) -> go.Figure:
     products = filter_by_date_range(products, "week_start", date_range)
-    ylab = volume_label(unit)
+    flow_unit = unit or "kbd"
+    # Stocks are inventory levels — never kb/d. Barrel flows → mb; metric → kt.
+    stock_unit = _inventory_unit(flow_unit)
+    flow_lbl = volume_label(flow_unit)
+    stock_lbl = volume_label(stock_unit)
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     df = products.sort_values("week_start")
 
@@ -406,7 +442,7 @@ def fig_products(products: pd.DataFrame, unit: str, date_range: str) -> go.Figur
             fig.add_trace(
                 go.Scatter(
                     x=df["week_start"],
-                    y=_vol(df[col], unit, metric=col),
+                    y=_vol(df[col], flow_unit, metric=col),
                     name=col.replace("_kt", "").replace("_", " ").title(),
                     mode="lines",
                     line=dict(color=color, width=2),
@@ -422,7 +458,7 @@ def fig_products(products: pd.DataFrame, unit: str, date_range: str) -> go.Figur
             fig.add_trace(
                 go.Scatter(
                     x=df["week_start"],
-                    y=df[col],
+                    y=_vol(df[col], stock_unit, metric=col),
                     name=col.replace("_kt", "").replace("_", " ").title(),
                     mode="lines",
                     line=dict(color=color, width=2, dash="dot"),
@@ -431,66 +467,98 @@ def fig_products(products: pd.DataFrame, unit: str, date_range: str) -> go.Figur
             )
 
     fig.update_layout(
-        title=f"National output ({ylab}, solid) vs commercial stocks (kt, dotted)",
+        title=(
+            f"National output ({flow_lbl}, solid) vs commercial stocks "
+            f"({stock_lbl}, dotted)"
+        ),
         hovermode="x unified",
     )
-    fig.update_yaxes(title_text=f"Weekly output ({ylab})", secondary_y=False)
-    fig.update_yaxes(title_text="Commercial stocks (kt)", secondary_y=True)
+    fig.update_yaxes(title_text=f"Weekly output ({flow_lbl})", secondary_y=False)
+    fig.update_yaxes(title_text=f"Commercial stocks ({stock_lbl})", secondary_y=True)
     return _apply_dark(fig)
 
 
-def fig_shandong_totals(totals: pd.DataFrame, product: str, date_range: str) -> go.Figure:
+def fig_shandong_totals(
+    totals: pd.DataFrame,
+    product: str,
+    date_range: str,
+    unit: str = "kbd",
+) -> go.Figure:
+    stock_unit = _inventory_unit(unit)
+    ylab = volume_label(stock_unit)
+    prod_key = SHANDONG_PRODUCT_MAP.get(product, product)
     sub = filter_by_date_range(totals[totals["product"] == product], "week_start", date_range)
+    y = (
+        _vol(sub["value_kt"], stock_unit, product=prod_key)
+        if not sub.empty
+        else sub.get("value_kt", pd.Series(dtype=float))
+    )
+    hover_fmt = "%{y:,.2f}" if stock_unit == "mb" else "%{y:,.0f}"
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=sub["week_start"],
-            y=sub["value_kt"],
+            x=sub["week_start"] if not sub.empty else [],
+            y=y,
             mode="lines+markers",
             line=dict(width=2),
             fill="tozeroy",
             fillcolor="rgba(88,166,255,0.12)",
-            hovertemplate="%{x|%Y-%m-%d}<br>%{y:,.0f} kt<extra></extra>",
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{hover_fmt} {ylab}<extra></extra>",
         )
     )
     fig.update_layout(
-        title=f"Shandong independents — total {product.replace('_', ' ')} stocks (kt)",
+        title=(
+            f"Shandong independents — total {product.replace('_', ' ')} "
+            f"stocks ({ylab})"
+        ),
         xaxis_title="Week",
-        yaxis_title="kt",
+        yaxis_title=ylab,
     )
     return _apply_dark(fig)
 
 
-def fig_shandong_heatmap(stocks: pd.DataFrame, product: str, date_range: str) -> go.Figure:
+def fig_shandong_heatmap(
+    stocks: pd.DataFrame,
+    product: str,
+    date_range: str,
+    unit: str = "kbd",
+) -> go.Figure:
+    stock_unit = _inventory_unit(unit)
+    ylab = volume_label(stock_unit)
+    prod_key = SHANDONG_PRODUCT_MAP.get(product, product)
     sub = filter_by_date_range(stocks[stocks["product"] == product], "week_start", date_range)
     if sub.empty:
         return _apply_dark(
-            go.Figure().update_layout(title="No Shandong stock data"),
+            go.Figure().update_layout(title=f"No Shandong {product.replace('_', ' ')} stock data"),
             height=420,
         )
 
     # Monthly mean reduces ~270 weekly columns to ~50 months; easier to read.
     sub = sub.copy()
     sub["month_start"] = sub["week_start"].dt.to_period("M").dt.to_timestamp()
+    sub["value_display"] = _vol(sub["value_kt"], stock_unit, product=prod_key)
     monthly = (
-        sub.groupby(["region", "month_start"], as_index=False)["value_kt"]
+        sub.groupby(["region", "month_start"], as_index=False)["value_display"]
         .mean()
     )
-    pivot = monthly.pivot(index="region", columns="month_start", values="value_kt")
+    pivot = monthly.pivot(index="region", columns="month_start", values="value_display")
     pivot = pivot.sort_index(axis=0).sort_index(axis=1)
 
     z_raw = pivot.values.astype(float)
     z_max = float(np.nanmax(z_raw)) if np.any(~np.isnan(z_raw)) else 1.0
-    z_max = max(z_max, 1.0)
+    z_max = max(z_max, 1e-6)
 
     # Plotly renders NaN as the plot background (looks like a black gap). Use -1 → gray.
-    z_color = np.where(np.isnan(z_raw), -1.0, z_raw)
+    # For mb scales, sentinel must sit below data; use a small negative vs data max.
+    z_sentinel = -1.0 if stock_unit == "kt" else -max(z_max * 0.05, 0.01)
+    z_color = np.where(np.isnan(z_raw), z_sentinel, z_raw)
     colorscale = [
         [0.0, "#30363d"],
         [0.001, "#dbeafe"],
         [1.0, "#1d4ed8"],
     ]
 
+    val_fmt = ",.2f" if stock_unit == "mb" else ",.0f"
     custom_hover = np.empty(z_raw.shape, dtype=object)
     for i, region in enumerate(pivot.index):
         for j, month in enumerate(pivot.columns):
@@ -498,7 +566,9 @@ def fig_shandong_heatmap(stocks: pd.DataFrame, product: str, date_range: str) ->
             if np.isnan(val):
                 custom_hover[i, j] = f"{region}<br>{pd.Timestamp(month):%Y-%m}<br>No data"
             else:
-                custom_hover[i, j] = f"{region}<br>{pd.Timestamp(month):%Y-%m}<br>{val:,.0f} kt"
+                custom_hover[i, j] = (
+                    f"{region}<br>{pd.Timestamp(month):%Y-%m}<br>{val:{val_fmt}} {ylab}"
+                )
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -506,15 +576,18 @@ def fig_shandong_heatmap(stocks: pd.DataFrame, product: str, date_range: str) ->
             x=[pd.Timestamp(c).strftime("%Y-%m") for c in pivot.columns],
             y=pivot.index.tolist(),
             colorscale=colorscale,
-            zmin=-1,
+            zmin=z_sentinel,
             zmax=z_max,
             customdata=custom_hover,
             hovertemplate="%{customdata}<extra></extra>",
-            colorbar=dict(title="kt"),
+            colorbar=dict(title=ylab),
         )
     )
     fig.update_layout(
-        title=f"Shandong {product.replace('_', ' ')} stocks by city (kt, monthly avg)",
+        title=(
+            f"Shandong {product.replace('_', ' ')} stocks by city "
+            f"({ylab}, monthly avg)"
+        ),
         xaxis=dict(tickangle=-45, type="category"),
     )
     return _apply_dark(fig, height=420)
@@ -550,60 +623,123 @@ def fig_monthly_processing(proc: pd.DataFrame, ownership: str, unit: str, date_r
     return _apply_dark(fig)
 
 
-def _margin_column(
-    margins_wide: pd.DataFrame,
+def _margin_factor_lookup(
+    margins: pd.DataFrame,
     refinery_type: str,
-    metric: str,
-    display_mode: str = "pct",
-) -> str | None:
-    prefix = refinery_type.replace(" ", "_").replace("-", "")
-    if metric == "contribution":
-        suffix = "contribution_margin"
-    elif metric == "gross":
-        suffix = "gross_profit_margin_pct" if display_mode == "pct" else "profit_per_ton"
-    elif metric == "net":
-        suffix = "net_profit_margin_pct" if display_mode == "pct" else "net_profit"
+    factor: str,
+) -> pd.Series:
+    """Week-indexed values for one SCI profit-model factor."""
+    if margins.empty:
+        return pd.Series(dtype=float)
+    sub = margins[
+        (margins["refinery_type"] == refinery_type) & (margins["factor"] == factor)
+    ][["week_start", "value"]].dropna()
+    if sub.empty:
+        return pd.Series(dtype=float)
+    return (
+        sub.sort_values("week_start")
+        .drop_duplicates("week_start", keep="last")
+        .set_index("week_start")["value"]
+        .astype(float)
+    )
+
+
+def _margin_axis_label(display_mode: str) -> str:
+    return {
+        "pct": "%",
+        "money": "RMB",
+        "rmb_mt": "RMB/mt",
+        "usd_bbl": "USD/bbl",
+    }.get(display_mode, display_mode)
+
+
+def _margin_series(
+    margins: pd.DataFrame,
+    *,
+    refinery_type: str,
+    margin_metric: str,
+    display_mode: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Build week_start × margin value for Economics charts.
+
+    display_mode:
+      pct     – gross/net % (contribution falls back to absolute RMB)
+      money   – absolute RMB (gross keeps legacy Profit-per-ton series)
+      rmb_mt  – unit margin in RMB/mt
+      usd_bbl – unit margin converted via USD/RMB FX and crude bbl/mt
+    """
+    empty = pd.DataFrame(columns=["week_start", "margin"])
+    label = _margin_axis_label(display_mode)
+
+    ppt = _margin_factor_lookup(margins, refinery_type, "Profit per ton")
+    net = _margin_factor_lookup(margins, refinery_type, "Net profit")
+    contrib = _margin_factor_lookup(margins, refinery_type, "Contribution margin")
+    fx = _margin_factor_lookup(margins, refinery_type, "USD to RMB Exchange Rate")
+    gross_pct = _margin_factor_lookup(margins, refinery_type, "Gross profit margin (%)")
+    net_pct = _margin_factor_lookup(margins, refinery_type, "Net profit margin (%)")
+
+    # Throughput implied by SCI: Net profit / Profit per ton (ppt treated as net RMB/mt).
+    throughput = (net / ppt).where((ppt != 0) & ppt.notna() & net.notna())
+
+    def _frame(series: pd.Series) -> pd.DataFrame:
+        s = series.dropna()
+        if s.empty:
+            return empty
+        return (
+            s.rename("margin")
+            .rename_axis("week_start")
+            .reset_index()
+            .sort_values("week_start")
+        )
+
+    def _to_usd_bbl(rmb_mt: pd.Series) -> pd.Series:
+        aligned = pd.concat([rmb_mt.rename("rmb"), fx.rename("fx")], axis=1).dropna()
+        if aligned.empty:
+            return pd.Series(dtype=float)
+        return aligned["rmb"] / aligned["fx"] / DEFAULT_BARRELS_PER_MT
+
+    if display_mode == "pct":
+        if margin_metric == "gross" and not gross_pct.empty:
+            return _frame(gross_pct * 100.0), "%"
+        if margin_metric == "net" and not net_pct.empty:
+            return _frame(net_pct * 100.0), "%"
+        # Contribution has no % series — show absolute RMB.
+        if not contrib.empty:
+            return _frame(contrib), "RMB"
+        return empty, label
+
+    if display_mode == "money":
+        # Preserve prior behaviour: gross→profit/ton, net→net RMB, contrib→contrib RMB.
+        if margin_metric == "gross" and not ppt.empty:
+            return _frame(ppt), "RMB/mt"
+        if margin_metric == "net" and not net.empty:
+            return _frame(net), "RMB"
+        if not contrib.empty:
+            return _frame(contrib), "RMB"
+        return empty, label
+
+    # Unit margins (RMB/mt), then optionally USD/bbl.
+    if margin_metric == "net":
+        rmb_mt = ppt
+    elif margin_metric in ("gross", "contribution"):
+        rmb_mt = (contrib / throughput).where(throughput.notna() & (throughput != 0))
     else:
-        suffix = ""
-    # Fuzzy match because pivot keys vary slightly
-    for c in margins_wide.columns:
-        if c == "week_start":
-            continue
-        if prefix.lower() not in c.lower():
-            continue
-        cl = c.lower()
-        if suffix == "gross_profit_margin_pct" and "gross_profit_margin" in cl:
-            return c
-        if suffix == "net_profit_margin_pct" and "net_profit_margin" in cl:
-            return c
-        if suffix == "profit_per_ton" and "profit_per_ton" in cl:
-            return c
-        if suffix == "net_profit" and "net_profit" in cl and "margin" not in cl:
-            return c
-        if suffix == "contribution_margin" and "contribution_margin" in cl:
-            return c
-    return None
+        rmb_mt = pd.Series(dtype=float)
 
+    if rmb_mt.dropna().empty:
+        return empty, label
 
-def _margin_axis_label(margin_metric: str, display_mode: str) -> str:
-    if margin_metric == "contribution":
-        return "RMB"
-    if margin_metric in ("gross", "net") and display_mode == "pct":
-        return "%"
-    if margin_metric == "gross":
-        return "RMB/mt"
-    return "RMB"
-
-
-def _scale_margin_values(values: pd.Series, margin_metric: str, display_mode: str) -> pd.Series:
-    if margin_metric in ("gross", "net") and display_mode == "pct":
-        return values * 100
-    return values
+    if display_mode == "rmb_mt":
+        return _frame(rmb_mt), "RMB/mt"
+    if display_mode == "usd_bbl":
+        return _frame(_to_usd_bbl(rmb_mt)), "USD/bbl"
+    return empty, label
 
 
 def fig_economics_overlay(
     runs: pd.DataFrame,
-    margins_wide: pd.DataFrame,
+    margins: pd.DataFrame,
     unit: str,
     date_range: str,
     refinery_type: str,
@@ -612,11 +748,16 @@ def fig_economics_overlay(
     display_mode: str = "pct",
 ) -> go.Figure:
     runs = filter_by_date_range(runs, "week_start", date_range)
-    margins_wide = filter_by_date_range(margins_wide, "week_start", date_range)
     ylab = volume_label(unit)
 
     run_sub = runs[runs["breakdown"] == runs_breakdown].sort_values("week_start")
-    margin_col = _margin_column(margins_wide, refinery_type, margin_metric, display_mode)
+    margin_df, y2 = _margin_series(
+        margins,
+        refinery_type=refinery_type,
+        margin_metric=margin_metric,
+        display_mode=display_mode,
+    )
+    margin_df = filter_by_date_range(margin_df, "week_start", date_range)
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     if not run_sub.empty:
@@ -631,14 +772,12 @@ def fig_economics_overlay(
             secondary_y=False,
         )
 
-    if margin_col and margin_col in margins_wide.columns:
-        m = margins_wide.sort_values("week_start")
-        y_margin = _scale_margin_values(m[margin_col], margin_metric, display_mode)
+    if not margin_df.empty:
         fig.add_trace(
             go.Scatter(
-                x=m["week_start"],
-                y=y_margin,
-                name=f"{refinery_type} {margin_metric} margin",
+                x=margin_df["week_start"],
+                y=margin_df["margin"],
+                name=f"{refinery_type} {margin_metric} ({y2})",
                 line=dict(color=MARGIN_COLORS.get(margin_metric, "#e3b341"), width=2, dash="dot"),
                 mode="lines",
             ),
@@ -647,14 +786,13 @@ def fig_economics_overlay(
 
     fig.update_layout(title="Refinery runs vs modelled margins", hovermode="x unified")
     fig.update_yaxes(title_text=f"Processing ({ylab})", secondary_y=False)
-    y2 = _margin_axis_label(margin_metric, display_mode)
     fig.update_yaxes(title_text=f"Margin ({y2})", secondary_y=True)
     return _apply_dark(fig)
 
 
 def fig_economics_scatter(
     runs: pd.DataFrame,
-    margins_wide: pd.DataFrame,
+    margins: pd.DataFrame,
     date_range: str,
     refinery_type: str,
     margin_metric: str,
@@ -662,26 +800,34 @@ def fig_economics_scatter(
     display_mode: str = "pct",
 ) -> go.Figure:
     runs = filter_by_date_range(runs, "week_start", date_range)
-    margins_wide = filter_by_date_range(margins_wide, "week_start", date_range)
-    margin_col = _margin_column(margins_wide, refinery_type, margin_metric, display_mode)
+    margin_df, xlab = _margin_series(
+        margins,
+        refinery_type=refinery_type,
+        margin_metric=margin_metric,
+        display_mode=display_mode,
+    )
+    margin_df = filter_by_date_range(margin_df, "week_start", date_range)
 
     run_sub = runs[runs["breakdown"] == runs_breakdown][["week_start", "processing_kt"]]
-    if margin_col is None or run_sub.empty:
+    if margin_df.empty or run_sub.empty:
         return _apply_dark(go.Figure().update_layout(title="Insufficient margin data"))
 
-    merged = run_sub.merge(margins_wide[["week_start", margin_col]], on="week_start", how="inner")
-    x = _scale_margin_values(merged[margin_col], margin_metric, display_mode)
-    xlab = _margin_axis_label(margin_metric, display_mode)
+    merged = run_sub.merge(margin_df, on="week_start", how="inner")
+    if merged.empty:
+        return _apply_dark(go.Figure().update_layout(title="Insufficient margin data"))
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=x,
+            x=merged["margin"],
             y=_vol(merged["processing_kt"], "kbd", metric="processing_kt"),
             mode="markers",
             marker=dict(size=8, color="#58a6ff", opacity=0.75),
             text=[d.strftime("%Y-%m-%d") for d in merged["week_start"]],
-            hovertemplate="Week: %{text}<br>Margin: %{x:.1f}<br>Runs: %{y:,.0f} kb/d<extra></extra>",
+            hovertemplate=(
+                f"Week: %{{text}}<br>Margin: %{{x:.2f}} {xlab}"
+                "<br>Runs: %{y:,.0f} kb/d<extra></extra>"
+            ),
         )
     )
     fig.update_layout(
@@ -800,7 +946,36 @@ def _build_layout() -> dbc.Container:
                     dbc.Tab(
                         label="Crude Runs",
                         children=[
-                            dcc.Graph(id="runs-volume-chart", config={"displayModeBar": True}),
+                            html.H5("Weekly scorecard", className="mt-3 mb-1"),
+                            html.P(
+                                id="runs-scorecard-subtitle",
+                                children=(
+                                    "Latest SCI weekly summary. Processing follows the global "
+                                    "unit toggle; operating rates in %. National is the total."
+                                ),
+                                className="text-muted small mb-2",
+                            ),
+                            html.Div(
+                                _dark_datatable(
+                                    id="runs-scorecard-table",
+                                    columns=[{"name": "segment", "id": "segment"}],
+                                    data=[],
+                                    style_cell_conditional=[
+                                        {
+                                            "if": {"column_id": "segment"},
+                                            "textAlign": "left",
+                                        }
+                                    ],
+                                    style_data_conditional=runs_scorecard_style(),
+                                    page_size=5,
+                                ),
+                                className="mb-4",
+                            ),
+                            dcc.Graph(
+                                id="runs-volume-chart",
+                                config={"displayModeBar": True},
+                                className="mt-2",
+                            ),
                             dcc.Graph(id="runs-rate-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="balance-monthly-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="spread-chart", config={"displayModeBar": True}),
@@ -868,35 +1043,9 @@ def _build_layout() -> dbc.Container:
                                 "Latest week at a glance. Apparent demand ≈ output − inventory build "
                                 "(ex-exports). Days cover = stocks ÷ daily production "
                                 "(stocks × 7 / weekly output) — not vs demand. "
-                                "Kerosene has no national commercial stocks in SCI.",
+                                "Kerosene has no national commercial stocks in SCI. "
+                                "Stocks use mb when flows are kb/d, else kt.",
                                 className="text-muted small mb-2",
-                            ),
-                            dbc.Row(
-                                [
-                                    dbc.Col(
-                                        _dropdown(
-                                            id="products-stock-unit",
-                                            options=[
-                                                {"label": "Stocks: mb", "value": "mb"},
-                                                {"label": "Stocks: kt", "value": "kt"},
-                                            ],
-                                            value="mb",
-                                        ),
-                                        width=2,
-                                    ),
-                                    dbc.Col(
-                                        _dropdown(
-                                            id="products-flow-unit",
-                                            options=[
-                                                {"label": "Flows: kb/d", "value": "kbd"},
-                                                {"label": "Flows: kt", "value": "kt"},
-                                            ],
-                                            value="kbd",
-                                        ),
-                                        width=2,
-                                    ),
-                                ],
-                                className="g-2 mb-2",
                             ),
                             _dark_datatable(
                                 id="products-change-table",
@@ -933,31 +1082,30 @@ def _build_layout() -> dbc.Container:
                         label="Shandong Stocks",
                         children=[
                             html.P(
-                                "Heatmap shows monthly average stocks by city. "
+                                "One total + city heatmap per product. "
+                                "Heatmaps use monthly average stocks by city. "
                                 "Dark gray cells = no data reported for that city/month (not zero). "
-                                "Hover for values.",
+                                "Stocks use mb when the global unit is kb/d, else kt.",
                                 className="text-muted small mt-2 mb-1",
                             ),
-                            dbc.Row(
-                                [
-                                    dbc.Col(
-                                        _dropdown(
-                                            id="shandong-product",
-                                            options=[
-                                                {"label": "Crude oil", "value": "crude_oil"},
-                                                {"label": "Gasoline", "value": "gasoline"},
-                                                {"label": "Diesel", "value": "diesel"},
-                                                {"label": "Naphtha", "value": "naphtha"},
-                                            ],
-                                            value="crude_oil",
-                                        ),
-                                        width=3,
+                            *[
+                                item
+                                for product in SHANDONG_STOCK_PRODUCTS
+                                for item in (
+                                    html.H5(
+                                        product.replace("_", " ").title(),
+                                        className="mt-3 mb-1",
                                     ),
-                                ],
-                                className="mt-2",
-                            ),
-                            dcc.Graph(id="shandong-total-chart", config={"displayModeBar": True}),
-                            dcc.Graph(id="shandong-heatmap-chart", config={"displayModeBar": True}),
+                                    dcc.Graph(
+                                        id=f"shandong-total-{product}",
+                                        config={"displayModeBar": True},
+                                    ),
+                                    dcc.Graph(
+                                        id=f"shandong-heatmap-{product}",
+                                        config={"displayModeBar": True},
+                                    ),
+                                )
+                            ],
                         ],
                     ),
                     dbc.Tab(
@@ -989,7 +1137,7 @@ def _build_layout() -> dbc.Container:
                                             options=[
                                                 {"label": "Gross profit margin", "value": "gross"},
                                                 {"label": "Net profit margin", "value": "net"},
-                                                {"label": "Contribution margin (RMB)", "value": "contribution"},
+                                                {"label": "Contribution margin", "value": "contribution"},
                                             ],
                                             value="gross",
                                         ),
@@ -1001,6 +1149,8 @@ def _build_layout() -> dbc.Container:
                                             options=[
                                                 {"label": "Margin (%)", "value": "pct"},
                                                 {"label": "RMB value", "value": "money"},
+                                                {"label": "RMB/mt", "value": "rmb_mt"},
+                                                {"label": "USD/bbl", "value": "usd_bbl"},
                                             ],
                                             value="pct",
                                         ),
@@ -1023,6 +1173,55 @@ def _build_layout() -> dbc.Container:
                             ),
                             dcc.Graph(id="econ-overlay-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="econ-scatter-chart", config={"displayModeBar": True}),
+                            html.H5("Profit drivers (WoW)", className="mt-4 mb-1"),
+                            html.P(
+                                id="econ-driver-subtitle",
+                                children=(
+                                    "SCI profit-model bridge for the selected refinery type. "
+                                    "Sales − feedstock = contribution; contribution − taxes/opex = net."
+                                ),
+                                className="text-muted small mb-2",
+                            ),
+                            dcc.Graph(
+                                id="econ-waterfall-chart",
+                                config={"displayModeBar": True},
+                                className="mb-3",
+                            ),
+                            html.H6("P&L", className="mt-2 mb-1"),
+                            html.Div(
+                                _dark_datatable(
+                                    id="econ-driver-pnl-table",
+                                    columns=[{"name": "driver", "id": "driver"}],
+                                    data=[],
+                                    style_cell_conditional=[
+                                        {"if": {"column_id": c}, "textAlign": "left"}
+                                        for c in ("driver", "unit", "note")
+                                    ],
+                                    style_data_conditional=profit_driver_scorecard_style(),
+                                    page_size=16,
+                                ),
+                                className="mb-3",
+                            ),
+                            html.H6("Prices & crude markers", className="mt-2 mb-1"),
+                            html.P(
+                                "All product prices in the selected model (RMB/mt), plus Brent/WTI. "
+                                "Sorted by largest absolute WoW move.",
+                                className="text-muted small mb-2",
+                            ),
+                            html.Div(
+                                _dark_datatable(
+                                    id="econ-driver-price-table",
+                                    columns=[{"name": "driver", "id": "driver"}],
+                                    data=[],
+                                    style_cell_conditional=[
+                                        {"if": {"column_id": c}, "textAlign": "left"}
+                                        for c in ("driver", "unit", "note")
+                                    ],
+                                    style_data_conditional=profit_driver_scorecard_style(),
+                                    page_size=25,
+                                ),
+                                className="mb-3",
+                            ),
                         ],
                     ),
                     dbc.Tab(
@@ -1196,6 +1395,106 @@ def _build_layout() -> dbc.Container:
                                             ),
                                             dcc.Graph(
                                                 id="mobility-passenger-possession",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2 mt-1",
+                            ),
+                            html.H5("Mobility depth", className="mt-4 mb-1"),
+                            html.P(
+                                "Sales vs possession shows the electrification lag. "
+                                "Heavy trucks isolate the main diesel fleet. "
+                                "Provincial map uses the latest passenger sales month.",
+                                className="text-muted small mb-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Passenger: NEV sales vs fleet share (lag)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-pax-sales-vs-fleet",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Trucks: sales vs fleet fuel shares",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-truck-sales-vs-fleet",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Heavy truck sales mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-heavy-sales-mix",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Heavy truck fleet mix",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-heavy-fleet-mix",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                ],
+                                className="g-2 mt-1",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Provincial passenger NEV sales share (map)",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-provincial-nev-map",
+                                                config={"displayModeBar": True},
+                                            ),
+                                        ],
+                                        width=6,
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            html.H6(
+                                                "Top provinces by passenger NEV sales share",
+                                                className="mb-1 text-light text-center",
+                                            ),
+                                            dcc.Graph(
+                                                id="mobility-provincial-nev-bars",
                                                 config={"displayModeBar": True},
                                             ),
                                         ],
@@ -1402,6 +1701,28 @@ def _build_layout() -> dbc.Container:
                                 ],
                                 className="mt-2 g-2",
                             ),
+                            html.H5("Exports", className="mt-3 mb-1"),
+                            html.P(
+                                "Latest-year monthly totals by product. Forward months without "
+                                "shipping actuals use sheet-41 forecast cargoes (unconfirmed). "
+                                "Follows the global unit toggle.",
+                                className="text-muted small mb-2",
+                            ),
+                            _dark_datatable(
+                                id="export-monthly-pivot-table",
+                                columns=[{"name": "Exports (kt)", "id": "product"}],
+                                data=[],
+                                style_cell_conditional=[
+                                    {"if": {"column_id": "product"}, "textAlign": "left"}
+                                ],
+                                style_data_conditional=[
+                                    {
+                                        "if": {"filter_query": '{product} = "Total"'},
+                                        "fontWeight": "700",
+                                    }
+                                ],
+                                page_size=10,
+                            ),
                             dcc.Graph(id="export-monthly-chart", config={"displayModeBar": True}),
                             dbc.Row(
                                 [
@@ -1425,11 +1746,11 @@ def _build_layout() -> dbc.Container:
                             dcc.Graph(id="export-sankey-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="export-quotas-monthly-chart", config={"displayModeBar": True}),
                             dcc.Graph(id="export-quota-summary-chart", config={"displayModeBar": True}),
-                            html.H5("Forward export plan tracker", className="mt-3 mb-1"),
+                            html.H5("Forward export forecast tracker", className="mt-3 mb-1"),
                             html.P(
-                                "Sheet 41 weekly cargo forecasts stand in for SCI company monthly "
-                                "export plans (not published in the API datapack). Compare planned "
-                                "loadings vs MTD actuals and the same month last year.",
+                                "Sheet 41 weekly cargo forecasts (not the SCI company monthly export "
+                                "plan, which is not in the API datapack). Compare forecasted loadings "
+                                "vs MTD actuals and the same month last year.",
                                 className="text-muted small mb-2",
                             ),
                             dcc.Graph(id="export-forecast-plan-chart", config={"displayModeBar": True}),
@@ -1439,26 +1760,20 @@ def _build_layout() -> dbc.Container:
                                     {"name": "month", "id": "month"},
                                     {"name": "product", "id": "product"},
                                     {
-                                        "name": "planned_kt",
-                                        "id": "planned_kt",
+                                        "name": "forecasted",
+                                        "id": "forecasted",
                                         "type": "numeric",
                                         "format": {"specifier": ",.1f"},
                                     },
                                     {
-                                        "name": "mtd_actual_kt",
-                                        "id": "mtd_actual_kt",
+                                        "name": "mtd_actual",
+                                        "id": "mtd_actual",
                                         "type": "numeric",
                                         "format": {"specifier": ",.1f"},
                                     },
                                     {
-                                        "name": "remaining_vs_plan_kt",
-                                        "id": "remaining_vs_plan_kt",
-                                        "type": "numeric",
-                                        "format": {"specifier": ",.1f"},
-                                    },
-                                    {
-                                        "name": "same_month_ly_kt",
-                                        "id": "same_month_ly_kt",
+                                        "name": "same_month_ly",
+                                        "id": "same_month_ly",
                                         "type": "numeric",
                                         "format": {"specifier": ",.1f"},
                                     },
@@ -1477,8 +1792,8 @@ def _build_layout() -> dbc.Container:
                                     {"name": "departure", "id": "departure"},
                                     {"name": "product", "id": "product"},
                                     {
-                                        "name": "volume_kt",
-                                        "id": "volume_kt",
+                                        "name": "volume",
+                                        "id": "volume",
                                         "type": "numeric",
                                         "format": {"specifier": ",.1f"},
                                     },
@@ -1504,7 +1819,11 @@ def _build_layout() -> dbc.Container:
                                 ],
                                 page_size=12,
                             ),
-                            html.H5("Monthly exports (kt)", className="mt-3 mb-2"),
+                            dcc.Graph(
+                                id="export-forecast-sankey-chart",
+                                config={"displayModeBar": True},
+                            ),
+                            html.H5("Monthly exports", className="mt-3 mb-2"),
                             dbc.Row(
                                 [
                                     dbc.Col(
@@ -1865,15 +2184,31 @@ app.layout = _build_layout()
     Output("runs-rate-chart", "figure"),
     Output("balance-monthly-chart", "figure"),
     Output("spread-chart", "figure"),
+    Output("runs-scorecard-table", "columns"),
+    Output("runs-scorecard-table", "data"),
+    Output("runs-scorecard-subtitle", "children"),
     Input("unit-select", "value"),
     Input("date-range-select", "value"),
 )
 def update_runs_charts(unit, date_range):
+    unit = unit or "kbd"
+    records, columns, week_lbl = runs_scorecard_records(
+        FRAMES.get("runs_wide", pd.DataFrame()),
+        unit=unit,
+    )
+    week_bit = f"Week ending {week_lbl}. " if week_lbl else ""
+    subtitle = (
+        f"{week_bit}Latest SCI weekly summary. Processing follows the global "
+        "unit toggle; operating rates in %. National is the total."
+    )
     return (
         fig_runs_volume(FRAMES["runs_wide"], unit, date_range),
         fig_runs_rate(FRAMES["runs_wide"], date_range),
         fig_balance_monthly(FRAMES.get("balance_monthly", pd.DataFrame()), unit, date_range),
         fig_soe_indep_spread(FRAMES["runs_wide"], date_range),
+        columns,
+        records,
+        subtitle,
     )
 
 
@@ -1885,20 +2220,18 @@ def update_runs_charts(unit, date_range):
     Output("products-output-delta-chart", "figure"),
     Input("unit-select", "value"),
     Input("date-range-select", "value"),
-    Input("products-stock-unit", "value"),
-    Input("products-flow-unit", "value"),
 )
-def update_products(unit, date_range, stock_unit, flow_unit):
+def update_products(unit, date_range):
     wide = FRAMES.get("products_stocks_wide", pd.DataFrame())
-    stock_unit = stock_unit or "mb"
-    flow_unit = flow_unit or "kbd"
+    flow_unit = unit or "kbd"
+    stock_unit = _inventory_unit(flow_unit)
     records, columns = products_scorecard_records(
         wide,
         stock_unit=stock_unit,
         flow_unit=flow_unit,
     )
     return (
-        fig_products(wide, unit, date_range),
+        fig_products(wide, flow_unit, date_range),
         columns,
         records,
         _apply_dark(
@@ -1915,21 +2248,41 @@ def update_products(unit, date_range, stock_unit, flow_unit):
 
 
 @app.callback(
-    Output("shandong-total-chart", "figure"),
-    Output("shandong-heatmap-chart", "figure"),
-    Input("shandong-product", "value"),
+    *[
+        Output(f"shandong-total-{product}", "figure")
+        for product in SHANDONG_STOCK_PRODUCTS
+    ],
+    *[
+        Output(f"shandong-heatmap-{product}", "figure")
+        for product in SHANDONG_STOCK_PRODUCTS
+    ],
+    Input("unit-select", "value"),
     Input("date-range-select", "value"),
 )
-def update_shandong(product, date_range):
-    return (
-        fig_shandong_totals(FRAMES["shandong_stocks_total"], product, date_range),
-        fig_shandong_heatmap(FRAMES["shandong_stocks"], product, date_range),
-    )
+def update_shandong(unit, date_range):
+    totals = FRAMES.get("shandong_stocks_total", pd.DataFrame())
+    stocks = FRAMES.get("shandong_stocks", pd.DataFrame())
+    unit = unit or "kbd"
+    total_figs = [
+        fig_shandong_totals(totals, product, date_range, unit=unit)
+        for product in SHANDONG_STOCK_PRODUCTS
+    ]
+    heat_figs = [
+        fig_shandong_heatmap(stocks, product, date_range, unit=unit)
+        for product in SHANDONG_STOCK_PRODUCTS
+    ]
+    return (*total_figs, *heat_figs)
 
 
 @app.callback(
     Output("econ-overlay-chart", "figure"),
     Output("econ-scatter-chart", "figure"),
+    Output("econ-waterfall-chart", "figure"),
+    Output("econ-driver-pnl-table", "columns"),
+    Output("econ-driver-pnl-table", "data"),
+    Output("econ-driver-price-table", "columns"),
+    Output("econ-driver-price-table", "data"),
+    Output("econ-driver-subtitle", "children"),
     Input("unit-select", "value"),
     Input("date-range-select", "value"),
     Input("econ-refinery-type", "value"),
@@ -1938,28 +2291,40 @@ def update_shandong(product, date_range):
     Input("econ-runs-breakdown", "value"),
 )
 def update_economics(unit, date_range, refinery_type, margin_metric, display_mode, runs_breakdown):
-    margins = FRAMES.get("margins_wide", pd.DataFrame())
-    mode = display_mode if margin_metric in ("gross", "net") else "pct"
+    margins = FRAMES.get("margins", pd.DataFrame())
+    mode = display_mode or "pct"
+    metric = margin_metric or "gross"
+    refinery = refinery_type or "Fuel-oriented refineries"
+    breakdown = runs_breakdown or "Independents"
+    pnl_recs, pnl_cols, price_recs, price_cols, subtitle = profit_driver_scorecard(
+        margins, refinery_type=refinery
+    )
     return (
         fig_economics_overlay(
             FRAMES["runs_wide"],
             margins,
             unit,
             date_range,
-            refinery_type,
-            margin_metric,
-            runs_breakdown,
+            refinery,
+            metric,
+            breakdown,
             mode,
         ),
         fig_economics_scatter(
             FRAMES["runs_wide"],
             margins,
             date_range,
-            refinery_type,
-            margin_metric,
-            runs_breakdown,
+            refinery,
+            metric,
+            breakdown,
             mode,
         ),
+        _apply_dark(fig_profit_waterfall(margins, refinery_type=refinery)),
+        pnl_cols,
+        pnl_recs,
+        price_cols,
+        price_recs,
+        subtitle,
     )
 
 
@@ -2021,6 +2386,12 @@ def update_consumption_seasonal(unit):
     Output("mobility-truck-sales-mix", "figure"),
     Output("mobility-truck-possession", "figure"),
     Output("mobility-passenger-possession", "figure"),
+    Output("mobility-pax-sales-vs-fleet", "figure"),
+    Output("mobility-truck-sales-vs-fleet", "figure"),
+    Output("mobility-heavy-sales-mix", "figure"),
+    Output("mobility-heavy-fleet-mix", "figure"),
+    Output("mobility-provincial-nev-map", "figure"),
+    Output("mobility-provincial-nev-bars", "figure"),
     Input("unit-select", "value"),
 )
 def update_mobility_charts(unit):
@@ -2038,6 +2409,16 @@ def update_mobility_charts(unit):
         _apply_dark(fig_truck_sales_mix(com_sales), height=360),
         _apply_dark(fig_truck_possession_mix(com_poss), height=360),
         _apply_dark(fig_passenger_possession(pax_poss), height=360),
+        _apply_dark(
+            fig_passenger_sales_vs_possession(pax_sales, pax_poss), height=360
+        ),
+        _apply_dark(
+            fig_truck_sales_vs_possession(com_sales, com_poss), height=360
+        ),
+        _apply_dark(fig_heavy_truck_sales_mix(com_sales), height=360),
+        _apply_dark(fig_heavy_truck_possession_mix(com_poss), height=360),
+        _apply_dark(fig_provincial_nev_map(pax_sales), height=420),
+        _apply_dark(fig_provincial_nev_bars(pax_sales), height=420),
     )
 
 
@@ -2251,18 +2632,23 @@ def update_monthly(ownership, unit, date_range):
     Output("export-forecast-plan-chart", "figure"),
     Output("export-forecast-summary-table", "data"),
     Output("export-forecast-cargo-table", "data"),
+    Output("export-forecast-sankey-chart", "figure"),
+    Output("export-monthly-pivot-table", "columns"),
+    Output("export-monthly-pivot-table", "data"),
     Output("export-monthly-table", "data"),
+    Input("unit-select", "value"),
     Input("date-range-select", "value"),
     Input("export-product", "value"),
     Input("export-period", "value"),
     Input("export-monthly-source", "value"),
 )
-def update_exports(date_range, product, period, monthly_source):
+def update_exports(unit, date_range, product, period, monthly_source):
     shipping = FRAMES.get("export_shipping", pd.DataFrame())
     forecast = FRAMES.get("export_forecast", pd.DataFrame())
     quotas_monthly = FRAMES.get("export_quotas_monthly", pd.DataFrame())
     quotas_summary = FRAMES.get("export_quotas_summary", pd.DataFrame())
 
+    unit = unit or "kt"
     product = product or "All"
     period = period or "latest"
     monthly_source = monthly_source or "shipping"
@@ -2274,6 +2660,7 @@ def update_exports(date_range, product, period, monthly_source):
                 forecast,
                 product=product,
                 date_range=date_range,
+                unit=unit,
             )
         ),
         _apply_dark(
@@ -2282,6 +2669,7 @@ def update_exports(date_range, product, period, monthly_source):
                 product=product,
                 date_range=date_range,
                 period=period,
+                unit=unit,
             )
         ),
         _apply_dark(
@@ -2290,6 +2678,7 @@ def update_exports(date_range, product, period, monthly_source):
                 product=product,
                 date_range=date_range,
                 period=period,
+                unit=unit,
             )
         ),
         _apply_dark(
@@ -2298,18 +2687,42 @@ def update_exports(date_range, product, period, monthly_source):
                 product=product,
                 date_range=date_range,
                 period=period,
+                unit=unit,
             ),
             height=520,
         ),
-        _apply_dark(fig_export_quotas_monthly(quotas_monthly)),
-        _apply_dark(fig_export_quota_summary(quotas_summary, quotas_monthly)),
-        _apply_dark(fig_export_forecast_plan(forecast, shipping, product=product)),
-        export_forecast_summary_records(forecast, shipping, product=product),
-        export_forecast_table_records(forecast, product=product),
+        _apply_dark(fig_export_quotas_monthly(quotas_monthly, unit=unit)),
+        _apply_dark(fig_export_quota_summary(quotas_summary, quotas_monthly, unit=unit)),
+        _apply_dark(
+            fig_export_forecast_plan(forecast, shipping, product=product, unit=unit)
+        ),
+        export_forecast_summary_records(
+            forecast, shipping, product=product, unit=unit
+        ),
+        export_forecast_table_records(forecast, product=product, unit=unit),
+        _apply_dark(
+            fig_export_forecast_sankey(forecast, product=product, unit=unit),
+            height=520,
+        ),
+        export_monthly_pivot_columns(
+            shipping,
+            quotas_monthly,
+            forecast,
+            source=monthly_source,
+            unit=unit,
+        ),
+        export_monthly_pivot_records(
+            shipping,
+            quotas_monthly,
+            forecast,
+            source=monthly_source,
+            unit=unit,
+        ),
         export_monthly_table_records(
             shipping,
             quotas_monthly,
             source=monthly_source,
+            unit=unit,
         ),
     )
 
@@ -2318,15 +2731,17 @@ def update_exports(date_range, product, period, monthly_source):
     Output("export-monthly-download", "data"),
     Input("export-download-btn", "n_clicks"),
     Input("export-monthly-source", "value"),
+    Input("unit-select", "value"),
     prevent_initial_call=True,
 )
-def download_export_monthly(n_clicks, monthly_source):
+def download_export_monthly(n_clicks, monthly_source, unit):
     from src.exports import export_monthly_table_df
 
     df = export_monthly_table_df(
         FRAMES.get("export_shipping", pd.DataFrame()),
         FRAMES.get("export_quotas_monthly", pd.DataFrame()),
         source=monthly_source or "shipping",
+        unit=unit or "kt",
     )
     return dcc.send_data_frame(df.to_csv, "china_exports_monthly.csv", index=False)
 

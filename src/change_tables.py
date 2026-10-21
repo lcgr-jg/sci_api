@@ -453,6 +453,147 @@ def products_scorecard_style() -> list[dict]:
     return styles
 
 
+# SCI weekly feedstock processing breakdowns (National is the total — no extra Total row).
+_RUNS_BREAKDOWNS = ("National", "SOEs", "Independents")
+
+
+def _convert_runs_kt(kt: float, unit: str) -> float:
+    return float(
+        convert_volume_series(
+            pd.Series([kt]),
+            unit,
+            freq="weekly",
+            product="crude",
+        ).iloc[0]
+    )
+
+
+def runs_scorecard_records(
+    runs_wide: pd.DataFrame,
+    *,
+    unit: str = "kbd",
+) -> tuple[list[dict], list[dict], str | None]:
+    """
+    Latest-week feedstock processing scorecard by SCI breakdown.
+
+    Returns (records, columns, week_label). Processing level / Δ follow ``unit``;
+    operating rates stay in % / pp. No Total row — National already aggregates.
+    """
+    unit_lbl = volume_label(unit)
+    columns = [
+        {"name": "segment", "id": "segment"},
+        {
+            "name": f"processing ({unit_lbl})",
+            "id": "processing",
+            "type": "numeric",
+            "format": {"specifier": ",.1f"},
+        },
+        {
+            "name": f"Δ w/w ({unit_lbl})",
+            "id": "d_processing",
+            "type": "numeric",
+            "format": {"specifier": ",.1f"},
+        },
+        {
+            "name": "CDU rate (%)",
+            "id": "operating_rate",
+            "type": "numeric",
+            "format": {"specifier": ",.1f"},
+        },
+        {
+            "name": "Δ w/w (pp)",
+            "id": "d_operating_rate",
+            "type": "numeric",
+            "format": {"specifier": ",.1f"},
+        },
+    ]
+
+    if runs_wide.empty or "week_start" not in runs_wide.columns:
+        return [], columns, None
+
+    df = runs_wide.copy()
+    df["week_start"] = pd.to_datetime(df["week_start"])
+    df = df.dropna(subset=["week_start", "breakdown"])
+    if df.empty:
+        return [], columns, None
+
+    weeks = sorted(df["week_start"].unique())
+    latest = weeks[-1]
+    prev = weeks[-2] if len(weeks) > 1 else None
+    week_lbl = pd.Timestamp(latest).strftime("%d-%b-%y")
+
+    records: list[dict] = []
+    for bd in _RUNS_BREAKDOWNS:
+        cur = df[(df["week_start"] == latest) & (df["breakdown"] == bd)]
+        if cur.empty:
+            continue
+        cur_row = cur.iloc[0]
+        row: dict = {"segment": bd}
+
+        proc_cur = cur_row.get("processing_kt")
+        rate_cur = cur_row.get("operating_rate")
+
+        if pd.notna(proc_cur):
+            row["processing"] = _fmt_num(_convert_runs_kt(float(proc_cur), unit), 1)
+        else:
+            row["processing"] = None
+
+        if pd.notna(rate_cur):
+            row["operating_rate"] = _fmt_num(float(rate_cur) * 100.0, 1)
+        else:
+            row["operating_rate"] = None
+
+        if prev is not None:
+            prev_rows = df[(df["week_start"] == prev) & (df["breakdown"] == bd)]
+            if not prev_rows.empty:
+                prev_row = prev_rows.iloc[0]
+                proc_prev = prev_row.get("processing_kt")
+                rate_prev = prev_row.get("operating_rate")
+                if pd.notna(proc_cur) and pd.notna(proc_prev):
+                    row["d_processing"] = _fmt_num(
+                        _convert_runs_kt(float(proc_cur) - float(proc_prev), unit), 1
+                    )
+                else:
+                    row["d_processing"] = None
+                if pd.notna(rate_cur) and pd.notna(rate_prev):
+                    row["d_operating_rate"] = _fmt_num(
+                        (float(rate_cur) - float(rate_prev)) * 100.0, 1
+                    )
+                else:
+                    row["d_operating_rate"] = None
+            else:
+                row["d_processing"] = None
+                row["d_operating_rate"] = None
+        else:
+            row["d_processing"] = None
+            row["d_operating_rate"] = None
+
+        records.append(row)
+
+    return records, columns, week_lbl
+
+
+def runs_scorecard_style() -> list[dict]:
+    """Green / red text for signed runs Δ columns."""
+    styles = []
+    for col in ("d_processing", "d_operating_rate"):
+        styles.append(
+            {
+                "if": {"filter_query": f"{{{col}}} > 0", "column_id": col},
+                "color": "#3fb950",
+                "fontWeight": "600",
+            }
+        )
+        styles.append(
+            {
+                "if": {"filter_query": f"{{{col}}} < 0", "column_id": col},
+                "color": "#f85149",
+                "fontWeight": "600",
+            }
+        )
+    return styles
+
+
 def weekly_delta_frame(
     products: pd.DataFrame,
     *,
